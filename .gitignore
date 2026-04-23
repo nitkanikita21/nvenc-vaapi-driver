@@ -1,0 +1,11 @@
+/target
+*.swp
+*.swo
+.DS_Store
+
+# Per-developer Claude Code workspace (agent memories, per-project settings)
+.claude/
+
+# Generated outputs during local testing
+*.h264
+out.h264

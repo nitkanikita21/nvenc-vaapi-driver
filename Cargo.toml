@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = ["crates/va-sys"]
+
+[package]
+name = "libvaapi-rust-nvenc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Produce libnvidia_nvenc_drv_video.so so that libva (which expands
+# LIBVA_DRIVER_NAME=nvidia_nvenc -> lib<name>_drv_video.so) can dlopen us.
+[lib]
+name = "nvidia_nvenc_drv_video"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+va-sys = { path = "crates/va-sys" }
+slotmap = "1"
+parking_lot = "0.12"
+thiserror = "2"
+libc = "0.2"
+# CUDA Driver API via `cudarc`. `dynamic-loading` delays the dlopen of
+# libcuda.so.1 until the first API call, so the .so still loads on machines
+# without a CUDA-capable GPU (vainfo probes will then cleanly fail at
+# vaCreateContext rather than segfault/abort at dlopen time).
+cudarc = { version = "0.19", default-features = false, features = ["driver", "cuda-12020", "dynamic-loading"] }
+# NVENC safe wrapper. Also lazy-loads libnvidia-encode.so.1 via its own
+# build.rs (the crate's default feature set is empty; we take the default).
+nvidia-video-codec-sdk = "0.4"
+# Override transitive cudarc 0.16 (pulled in by nvidia-video-codec-sdk) to
+# disable its default `cuda-version-from-build-system` feature which requires
+# nvcc at build-time. We pin an explicit CUDA-version feature instead.
+# This *forces* cargo to take the union, so we also must keep `driver` +
+# `dynamic-loading` on.
+[dependencies.cudarc_016]
+package = "cudarc"
+version = "0.16"
+default-features = false
+features = ["driver", "cuda-12020", "dynamic-loading"]
+
+[dev-dependencies]
+libloading = "0.8"
+assert_cmd = "2"
+predicates = "3"
+once_cell = "1"
+va-sys = { path = "crates/va-sys" }
+libc = "0.2"
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"  # required: we catch_unwind at the ABI boundary

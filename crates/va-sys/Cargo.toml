@@ -1,0 +1,12 @@
+[package]
+name = "va-sys"
+version = "0.1.0"
+edition = "2024"
+publish = false
+links = "va_backend_headers"  # marker; we do not actually link libva
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+bindgen = "0.72"
