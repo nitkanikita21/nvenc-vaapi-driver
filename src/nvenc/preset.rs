@@ -93,7 +93,17 @@ pub fn choose(bitrate_bps: u64, fps: u32, rc_wants_cqp: bool) -> PresetChoice {
             enable_aq: false,
         };
     }
-    if bitrate_bps <= 2_500_000 && fps <= 30 {
+    // Chromium's WebRTC screen-share starts at ~244 kbps / 60 fps.
+    // Any `LowLatency` (non-ultra) tuning still lets NVENC's scheduler
+    // hold the first frame back with NEED_MORE_INPUT — Chromium then
+    // sees an empty coded-buffer on that frame, counts it as a drop, and
+    // after ~4 such drops its RateController cycles the encoder out
+    // (symptom: `Frames Encoded: 4`, `Resolution: undefined × undefined`
+    // in webrtc-internals). `UltraLowLatency` is the only tuning that
+    // guarantees 1-in-1-out once `frameIntervalP=1` and
+    // `zeroReorderDelay=1` are set, so WebRTC-class bitrates take it
+    // regardless of fps.
+    if bitrate_bps <= 2_500_000 {
         PresetChoice {
             preset: NvencPreset::P3,
             tuning: Tuning::UltraLowLatency,
@@ -275,10 +285,14 @@ mod tests {
     }
 
     #[test]
-    fn low_bitrate_but_fps_over_30_escalates_to_p4() {
-        // fps > 30 knocks us out of the P3 row even at tiny bitrate.
+    fn low_bitrate_at_60fps_still_p3_ultra_low_latency() {
+        // WebRTC screen-share bootstrap sits at ~244 kbps / 60 fps.
+        // UltraLowLatency is the only NVENC tuning that honours
+        // zeroReorderDelay strictly enough to avoid NEED_MORE_INPUT on
+        // the first frame, so this band must stay on P3 + ULL.
         let c = choose(500_000, 60, false);
-        assert_eq!(c.preset, NvencPreset::P4);
+        assert_eq!(c.preset, NvencPreset::P3);
+        assert_eq!(c.tuning, Tuning::UltraLowLatency);
     }
 
     #[test]
