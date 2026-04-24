@@ -445,45 +445,63 @@ impl NvencSession {
             }
         }
 
-        // Phase 3 — *always* deliver bytes to the client. WebRTC's encoder
-        // quality controller (VideoEncoderFactory in Chromium) evaluates us
-        // over the first ~8 frames and penalises any frame that arrived as
-        // an empty coded-buffer — it counts that as a drop and reduces our
-        // "score" compared to OpenH264, causing the HW↔SW cycling you see
-        // in RTC debug. To avoid the first-frame empty return we retry
-        // blocking Lock on Pending slots until FIFO has something. Bounded
-        // by pool size so we cannot loop forever.
-        let mut attempts = 0;
-        while self.pending_outputs.is_empty() && attempts < self.pool.len() {
-            attempts += 1;
-            let Some(idx) = self.oldest_pending_slot() else {
-                break;
-            };
-            match self.lock_and_copy(api, self.pool[idx].handle) {
-                Ok(bitstream) => {
+        // Phase 3 — try exactly one non-blocking drain of an oldest Pending
+        // slot if the FIFO is still empty. We intentionally do NOT do a
+        // blocking lock here: an earlier iteration that did was observed
+        // to freeze Vesktop when NVENC held an orphan Pending slot across
+        // a `reconfigure`, because `lock_and_copy` then waits forever for
+        // output NVENC will never produce on that slot. A single
+        // non-blocking probe is enough to cover the "NVENC finished this
+        // frame while we were still preparing the next" case, which is
+        // the only timing the WebRTC quality controller actually cares
+        // about.
+        if self.pending_outputs.is_empty() {
+            if let Some(idx) = self.oldest_pending_slot() {
+                let mut lock: nv::NV_ENC_LOCK_BITSTREAM = unsafe {
+                    MaybeUninit::zeroed().assume_init()
+                };
+                lock.version = nv::NV_ENC_LOCK_BITSTREAM_VER;
+                lock.outputBitstream = self.pool[idx].handle;
+                lock.set_doNotWait(1);
+                // SAFETY: encoder + slot handle both valid.
+                let s = unsafe { (api.lock_bitstream)(self.encoder, &mut lock) };
+                if s == nv::NVENCSTATUS::NV_ENC_SUCCESS {
+                    let len = lock.bitstreamSizeInBytes as usize;
+                    let mut data: Vec<u8> = Vec::with_capacity(len);
+                    // SAFETY: NVENC gave us a readable ptr of length `bitstreamSizeInBytes`.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            lock.bitstreamBufferPtr as *const u8,
+                            data.as_mut_ptr(),
+                            len,
+                        );
+                        data.set_len(len);
+                    }
+                    let is_idr =
+                        lock.pictureType == nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR;
+                    // SAFETY: just-locked handle.
+                    let _ = unsafe {
+                        (api.unlock_bitstream)(self.encoder, self.pool[idx].handle)
+                    };
                     if let SlotState::Pending { mapped_input, .. } = self.pool[idx].state {
-                        // SAFETY: mapped_input came from MapInputResource.
+                        // SAFETY: mapped_input alive across Pending state.
                         let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
                     }
                     self.pool[idx].state = SlotState::Free;
-                    self.pending_outputs.push_back(bitstream);
-                }
-                Err(_) => {
-                    // Blocking lock refused (should not happen with a real
-                    // Pending slot). Free it and move on.
-                    if let SlotState::Pending { mapped_input, .. } = self.pool[idx].state {
-                        // SAFETY: mapped_input came from MapInputResource.
-                        let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
-                    }
-                    self.pool[idx].state = SlotState::Free;
+                    self.pending_outputs.push_back(CodedBitstream {
+                        data,
+                        is_pending: false,
+                        is_idr,
+                    });
                 }
             }
         }
 
-        // Pop the oldest ready bitstream. In the truly-impossible case
-        // (empty pool + empty FIFO after retries), return is_pending=true;
-        // the caller still writes an empty coded-buffer but this only
-        // happens when NVENC is catastrophically broken.
+        // Pop the oldest ready bitstream. When nothing is ready we return
+        // is_pending=true — the caller writes an empty coded-buffer for
+        // this frame, NVENC flushes it next time. WebRTC does penalise
+        // this as a drop; that is the root of the HW↔SW cycling we see
+        // in Vesktop, but it is preferable to a freeze.
         Ok(self.pending_outputs.pop_front().unwrap_or(CodedBitstream {
             data: Vec::new(),
             is_pending: true,
