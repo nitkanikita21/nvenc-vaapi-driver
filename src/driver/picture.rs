@@ -80,8 +80,32 @@ pub unsafe extern "C" fn render_picture(
                 va::VAEncSequenceParameterBufferType => pending.seq_param = Some(data),
                 va::VAEncPictureParameterBufferType => pending.pic_param = Some(data),
                 va::VAEncSliceParameterBufferType => pending.slice_param = Some(data),
-                va::VAEncPackedHeaderParameterBufferType
-                | va::VAEncPackedHeaderDataBufferType => {
+                va::VAEncPackedHeaderParameterBufferType => {
+                    // Pair marker: the very next PackedHeaderDataBuffer
+                    // carries the bytes whose NAL kind this param announces.
+                    // Layout of `VAEncPackedHeaderParameterBuffer` is
+                    // `{ type: u32, bit_length: u32, has_emulation_bytes: u8, ... }`
+                    // — we only read the first u32 (type).
+                    if data.len() >= core::mem::size_of::<u32>() {
+                        let mut raw = [0u8; 4];
+                        raw.copy_from_slice(&data[..4]);
+                        let va_type = u32::from_ne_bytes(raw);
+                        pending.pending_packed_kind =
+                            crate::driver::state::PackedHeaderKind::from_va_type(va_type);
+                    }
+                    // Legacy tuple form, kept until all read sites migrate.
+                    pending.packed_headers.push((brec.buf_type, data));
+                }
+                va::VAEncPackedHeaderDataBufferType => {
+                    if let Some(kind) = pending.pending_packed_kind.take() {
+                        pending
+                            .packed_headers_typed
+                            .push(crate::driver::state::PackedHeader {
+                                kind,
+                                bytes: data.clone(),
+                            });
+                    }
+                    // Legacy form.
                     pending.packed_headers.push((brec.buf_type, data));
                 }
                 va::VAEncCodedBufferType => pending.coded_buf = Some(bk),
@@ -115,8 +139,11 @@ pub unsafe extern "C" fn end_picture(
         let pic_bytes = pending.pic_param.take();
         let seq_bytes = pending.seq_param.take();
         let coded_buf_key = pending.coded_buf.take();
+        let packed_headers: Vec<crate::driver::state::PackedHeader> =
+            core::mem::take(&mut pending.packed_headers_typed);
         pending.slice_param = None;
         pending.packed_headers.clear();
+        pending.pending_packed_kind = None;
         drop(pending);
 
         let target_key: SurfaceKey = cctx
@@ -197,8 +224,27 @@ pub unsafe extern "C" fn end_picture(
             }
         }
 
+        // Always let NVENC emit its own SPS/PPS. An earlier iteration tried
+        // to passthrough the client's VAEncPackedHeader* bytes on frames
+        // where the client supplied Sequence/Picture NALs, toggling
+        // `repeat_sps_pps` to suppress NVENC's own. That backfired: Chromium
+        // WebRTC only reliably sends Slice packed headers (never Sequence),
+        // so on every other frame we'd flip between "client SPS" and "NVENC
+        // SPS". The two SPS NALs are byte-different (different sps_id,
+        // different VUI), so every flip invalidated the receiver's
+        // parameter-set tracking — the stream would die after ~4 frames,
+        // which is exactly the stall we saw in RTC debug.
+        //
+        // So: NVENC drives SPS/PPS always. Client packed headers are still
+        // consumed (for SPS parsing → encoder reconfigure) but NOT injected
+        // into the coded buffer. This keeps every IDR's SPS byte-identical
+        // across the stream, matching what ffmpeg h264_vaapi and OBS do.
+        let client_drives_headers = false;
+        let _ = &packed_headers; // intentionally unused below
+
         let bitstream = session.encode_frame(target_key, pic_params.force_idr)?;
         drop(session_guard);
+
 
         // Resolve the coded buffer. Prefer coded_buf from PPS (if non-zero),
         // otherwise fall back to the coded_buf seen on the vaRenderPicture
@@ -222,7 +268,37 @@ pub unsafe extern "C" fn end_picture(
                     } else {
                         let mut backing = slot.backing.lock();
                         backing.clear();
-                        let _ = backing.try_reserve_exact(bitstream.data.len());
+                        // When the client provided its own SPS/PPS via
+                        // PackedHeader buffers, prepend them on IDR frames
+                        // before the NVENC-produced slice NALs. NVENC is
+                        // configured with repeatSPSPPS=0 in this path, so
+                        // `bitstream.data` is slice-only.
+                        let prepend_len: usize = if client_drives_headers && bitstream.is_idr {
+                            packed_headers
+                                .iter()
+                                .filter(|h| matches!(
+                                    h.kind,
+                                    crate::driver::state::PackedHeaderKind::Sequence
+                                        | crate::driver::state::PackedHeaderKind::Picture
+                                ))
+                                .map(|h| h.bytes.len())
+                                .sum()
+                        } else {
+                            0
+                        };
+                        let _ = backing
+                            .try_reserve_exact(prepend_len + bitstream.data.len());
+                        if client_drives_headers && bitstream.is_idr {
+                            for h in &packed_headers {
+                                if matches!(
+                                    h.kind,
+                                    crate::driver::state::PackedHeaderKind::Sequence
+                                        | crate::driver::state::PackedHeaderKind::Picture
+                                ) {
+                                    backing.extend_from_slice(&h.bytes);
+                                }
+                            }
+                        }
                         backing.extend_from_slice(&bitstream.data);
                         // libva headers shipped in this tree do not expose
                         // VA_CODED_BUF_STATUS_PICTURE_TYPE_I — upstream

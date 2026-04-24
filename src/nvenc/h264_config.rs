@@ -47,10 +47,19 @@ pub struct EncoderConfig {
     pub gop_length: u32,
     pub profile: H264Profile,
     pub rc_mode: preset::RcMode,
+    /// Коли `true`, NVENC сам вставляє SPS+PPS перед кожним IDR
+    /// (`repeatSPSPPS=1`). Це історичний default для ffmpeg/gst-клієнтів,
+    /// які не шлють `VAEncPackedHeader*`. Коли `false`, клієнт сам веде
+    /// SPS/PPS (WebRTC/Chromium), і драйвер конкатенує їх у coded-buffer
+    /// перед slice-байтами. `end_picture` перемикає цей прапорець на льоту
+    /// залежно від того, чи прилетіли packed-headers.
+    pub repeat_sps_pps: bool,
 }
 
 impl EncoderConfig {
-    /// Дефолт: 60 fps, 5 Mbps CBR, GOP = 120 кадрів (2 с).
+    /// Дефолт: 60 fps, 5 Mbps CBR, GOP = 120 кадрів (2 с), repeat_sps_pps=true.
+    /// Клієнти, що драйвлять свій SPS через PackedHeaderData (Chromium),
+    /// отримують `repeat_sps_pps=false` через `reconfigure` у `end_picture`.
     pub fn default_for(width: u32, height: u32, profile: H264Profile) -> Self {
         Self {
             width,
@@ -61,6 +70,7 @@ impl EncoderConfig {
             gop_length: 120,
             profile,
             rc_mode: preset::RcMode::Cbr,
+            repeat_sps_pps: true,
         }
     }
 }
@@ -137,6 +147,16 @@ pub fn apply_config(preset_cfg: &mut nv::NV_ENC_CONFIG, cfg: &EncoderConfig) {
         }
     }
 
+    // --- Low-latency realtime hints ---
+    // Без reorder-delay NVENC віддає кожен закодований кадр одразу, без
+    // внутрішнього framebuffer-у. Це критично для WebRTC-пайплайну: без
+    // цього прапорця NVENC повертає `NEED_MORE_INPUT` для перших кількох
+    // кадрів, Chromium отримує пусті bitstream-и і вимикає encoder.
+    rc.set_zeroReorderDelay(1);
+    // Lookahead тримаємо вимкненим — realtime screen share вимагає нульової
+    // латентності; lookahead додав би кілька кадрів затримки.
+    rc.set_enableLookahead(0);
+
     // --- H.264 кодек-specific ---
     // SAFETY: `encodeCodecConfig` — C-union; ми трактуємо його як
     // `h264Config`, що коректно, бо preset-config отримано з
@@ -154,7 +174,11 @@ pub fn apply_config(preset_cfg: &mut nv::NV_ENC_CONFIG, cfg: &EncoderConfig) {
         H264Profile::ConstrainedBaseline =>
             nv::NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC,
     };
-    h264.set_repeatSPSPPS(1); // на кожному IDR перевідправляти SPS/PPS (libva convention)
+    // `repeatSPSPPS` керується з `EncoderConfig`: ffmpeg-like клієнти
+    // хочуть SPS+PPS на кожному IDR від енкодера, WebRTC/Chromium — ні
+    // (Chromium пакує свій SPS у `VAEncPackedHeader*` і чекає що ми
+    // емітимо саме його байти).
+    h264.set_repeatSPSPPS(if cfg.repeat_sps_pps { 1 } else { 0 });
     h264.set_outputAUD(0); // AUD не вставляємо (libva client сам напакує)
 
     // --- VUI: BT.709 limited range ---
@@ -193,6 +217,7 @@ mod tests {
             gop_length: 120,
             profile: H264Profile::Main,
             rc_mode: preset::RcMode::Cbr,
+            repeat_sps_pps: true,
         }
     }
 
@@ -289,6 +314,7 @@ mod tests {
             gop_length: 1,
             profile: H264Profile::Main,
             rc_mode: preset::RcMode::Cbr,
+            repeat_sps_pps: true,
         };
         apply_config(&mut cfg, &ec);
         assert_eq!(cfg.gopLength, 1);

@@ -92,6 +92,14 @@ pub struct NvencSession {
     registered: HashMap<SurfaceKey, RegisteredSurface>,
     pool: Vec<BitstreamSlot>,
     next_slot: usize,
+    /// FIFO of already-locked coded bitstreams waiting to be returned to the
+    /// client. NVENC is free to delay output by several `encode_picture`
+    /// calls (internal reorder / B-frame / lookahead queues); whenever a
+    /// `LockBitstream` call produces bytes we push them here, and each
+    /// `encode_frame()` call pops the oldest entry. This means a client
+    /// always sees output in submission order even if NVENC buffered N
+    /// earlier frames.
+    pending_outputs: std::collections::VecDeque<CodedBitstream>,
 }
 
 // SAFETY: the NVENC encoder handle is an opaque driver resource; all access
@@ -220,6 +228,7 @@ impl NvencSession {
             registered: HashMap::new(),
             pool,
             next_slot: 0,
+            pending_outputs: std::collections::VecDeque::new(),
         })
     }
 
@@ -346,8 +355,20 @@ impl NvencSession {
         }
     }
 
-    /// Encode one frame and return the resulting bitstream (possibly empty
-    /// if NVENC deferred output).
+    /// Encode one frame, honouring NVENC's internal reorder buffer.
+    ///
+    /// Three-phase flow:
+    /// 1. **Non-blocking drain** — walk every Pending slot; ask NVENC with
+    ///    `doNotWait=1` if output is ready. Ready slots return to the pool
+    ///    and their bytes are pushed onto `pending_outputs`.
+    /// 2. **Encode** — map the requested surface, submit to NVENC. On
+    ///    SUCCESS we lock+copy synchronously; on `NEED_MORE_INPUT` the slot
+    ///    becomes Pending.
+    /// 3. **Guarantee output** — if the FIFO is still empty but there *is* a
+    ///    Pending slot, do a *blocking* `LockBitstream` on the oldest one.
+    ///    This keeps WebRTC clients happy (they expect each `vaEndPicture`
+    ///    to surface bytes) while still letting NVENC's reorder queue do
+    ///    its job.
     pub fn encode_frame(
         &mut self,
         key: SurfaceKey,
@@ -358,6 +379,9 @@ impl NvencSession {
             Err(_) => return Err(DriverError::OperationFailed("ENCODE_API unavailable")),
         };
 
+        // Phase 1 — non-blocking drain of already-ready Pending slots.
+        self.drain_pending_non_blocking(api);
+
         // 1. Look up registered surface (copy out fields so we release the
         //    &mut self borrow before we need &mut self.pool).
         let (reg_ptr, reg_w, reg_h, reg_pitch) = {
@@ -365,8 +389,7 @@ impl NvencSession {
             (reg.registered_ptr, reg.width, reg.height, reg.pitch)
         };
 
-        // 2. Pick a Free slot round-robin, starting at next_slot. If none are
-        //    free, we cannot make progress right now — clients must slow down.
+        // 2. Pick a Free slot round-robin, starting at next_slot.
         let slot_idx = self.find_free_slot().ok_or(DriverError::OperationFailed(
             "NVENC bitstream pool exhausted",
         ))?;
@@ -384,7 +407,7 @@ impl NvencSession {
         }
         let mapped_input = map.mappedResource;
 
-        // 4. Submit the encode call.
+        // Phase 2 — submit the encode call.
         let slot_handle = self.pool[slot_idx].handle;
         let mut pic = pic_params(
             reg_w,
@@ -405,7 +428,7 @@ impl NvencSession {
                 let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
                 self.pool[slot_idx].state = SlotState::Free;
                 self.next_slot = (slot_idx + 1) % self.pool.len();
-                Ok(bitstream)
+                self.pending_outputs.push_back(bitstream);
             }
             nv::NVENCSTATUS::NV_ENC_ERR_NEED_MORE_INPUT => {
                 // Deferred. Keep the mapped_input alive until NVENC flushes.
@@ -414,18 +437,132 @@ impl NvencSession {
                     _surface_key: key,
                 };
                 self.next_slot = (slot_idx + 1) % self.pool.len();
-                Ok(CodedBitstream {
-                    data: Vec::new(),
-                    is_pending: true,
-                    is_idr: false,
-                })
             }
             _ => {
                 // SAFETY: mapped_input was returned by MapInputResource.
                 let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
-                Err(DriverError::Encoding("NvEncEncodePicture"))
+                return Err(DriverError::Encoding("NvEncEncodePicture"));
             }
         }
+
+        // Phase 3 — *always* deliver bytes to the client. WebRTC's encoder
+        // quality controller (VideoEncoderFactory in Chromium) evaluates us
+        // over the first ~8 frames and penalises any frame that arrived as
+        // an empty coded-buffer — it counts that as a drop and reduces our
+        // "score" compared to OpenH264, causing the HW↔SW cycling you see
+        // in RTC debug. To avoid the first-frame empty return we retry
+        // blocking Lock on Pending slots until FIFO has something. Bounded
+        // by pool size so we cannot loop forever.
+        let mut attempts = 0;
+        while self.pending_outputs.is_empty() && attempts < self.pool.len() {
+            attempts += 1;
+            let Some(idx) = self.oldest_pending_slot() else {
+                break;
+            };
+            match self.lock_and_copy(api, self.pool[idx].handle) {
+                Ok(bitstream) => {
+                    if let SlotState::Pending { mapped_input, .. } = self.pool[idx].state {
+                        // SAFETY: mapped_input came from MapInputResource.
+                        let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
+                    }
+                    self.pool[idx].state = SlotState::Free;
+                    self.pending_outputs.push_back(bitstream);
+                }
+                Err(_) => {
+                    // Blocking lock refused (should not happen with a real
+                    // Pending slot). Free it and move on.
+                    if let SlotState::Pending { mapped_input, .. } = self.pool[idx].state {
+                        // SAFETY: mapped_input came from MapInputResource.
+                        let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
+                    }
+                    self.pool[idx].state = SlotState::Free;
+                }
+            }
+        }
+
+        // Pop the oldest ready bitstream. In the truly-impossible case
+        // (empty pool + empty FIFO after retries), return is_pending=true;
+        // the caller still writes an empty coded-buffer but this only
+        // happens when NVENC is catastrophically broken.
+        Ok(self.pending_outputs.pop_front().unwrap_or(CodedBitstream {
+            data: Vec::new(),
+            is_pending: true,
+            is_idr: false,
+        }))
+    }
+
+    /// Walk every Pending slot and try a non-blocking `LockBitstream`.
+    /// Slots that have output ready return to `Free` and push their
+    /// bitstream onto `self.pending_outputs`. Slots still busy stay
+    /// Pending. Other errors free the slot (log and continue).
+    fn drain_pending_non_blocking(&mut self, api: &EncodeAPI) {
+        for idx in 0..self.pool.len() {
+            let (handle, mapped_input) = match self.pool[idx].state {
+                SlotState::Pending { mapped_input, .. } => (self.pool[idx].handle, mapped_input),
+                _ => continue,
+            };
+            let mut lock: nv::NV_ENC_LOCK_BITSTREAM = unsafe {
+                MaybeUninit::zeroed().assume_init()
+            };
+            lock.version = nv::NV_ENC_LOCK_BITSTREAM_VER;
+            lock.outputBitstream = handle;
+            lock.set_doNotWait(1);
+            // SAFETY: encoder + handle both valid; lock is freshly zeroed.
+            let s = unsafe { (api.lock_bitstream)(self.encoder, &mut lock) };
+            match s {
+                nv::NVENCSTATUS::NV_ENC_SUCCESS => {
+                    let len = lock.bitstreamSizeInBytes as usize;
+                    let mut data: Vec<u8> = Vec::with_capacity(len);
+                    // SAFETY: NVENC returns a readable pointer of length `bitstreamSizeInBytes`.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            lock.bitstreamBufferPtr as *const u8,
+                            data.as_mut_ptr(),
+                            len,
+                        );
+                        data.set_len(len);
+                    }
+                    let is_idr = lock.pictureType == nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR;
+                    // SAFETY: handle we just locked.
+                    let _ = unsafe { (api.unlock_bitstream)(self.encoder, handle) };
+                    // SAFETY: mapped_input stayed alive across Pending state.
+                    let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
+                    self.pool[idx].state = SlotState::Free;
+                    self.pending_outputs.push_back(CodedBitstream {
+                        data,
+                        is_pending: false,
+                        is_idr,
+                    });
+                }
+                nv::NVENCSTATUS::NV_ENC_ERR_LOCK_BUSY => {
+                    // Not ready yet — leave Pending.
+                }
+                _ => {
+                    // Unexpected error. Free the slot so we don't wedge forever;
+                    // the mapped input is released best-effort.
+                    // SAFETY: mapped_input came from MapInputResource.
+                    let _ = unsafe { (api.unmap_input_resource)(self.encoder, mapped_input) };
+                    self.pool[idx].state = SlotState::Free;
+                }
+            }
+        }
+    }
+
+    /// Index of the oldest Pending slot, or None if none are pending.
+    /// Uses `next_slot` as a proxy for round-robin order: the Pending slot
+    /// nearest (next_slot - 1) in cyclic order is the oldest submission.
+    fn oldest_pending_slot(&self) -> Option<usize> {
+        let n = self.pool.len();
+        if n == 0 {
+            return None;
+        }
+        for offset in 0..n {
+            let idx = (self.next_slot + n - 1 - offset) % n;
+            if matches!(self.pool[idx].state, SlotState::Pending { .. }) {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Best-effort runtime reconfiguration. On failure we keep the old config

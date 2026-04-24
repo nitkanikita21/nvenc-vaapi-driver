@@ -114,13 +114,97 @@ pub struct ContextRec {
     pub last_coded: Mutex<Option<BufferKey>>,
 }
 
+/// Kind of a client-supplied packed header. Chromium's WebRTC VAAPI encoder
+/// drives SPS/PPS emission itself and expects the driver to honour its
+/// serialised NAL bytes verbatim. We map the H.264-relevant VA types into
+/// this enum; any other header type (e.g. HDR metadata misc types) is
+/// skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedHeaderKind {
+    /// SPS — `VAEncPackedHeaderSequence` (1).
+    Sequence,
+    /// PPS — `VAEncPackedHeaderPicture` (2).
+    Picture,
+    /// Slice header — `VAEncPackedHeaderSlice` (3). Rare for WebRTC,
+    /// NVENC normally emits its own slice header.
+    Slice,
+    /// Raw Annex-B NAL — `VAEncPackedHeaderRawData` (4). Discord/Chromium
+    /// is not observed to use this but we accept it for completeness.
+    RawData,
+}
+
+impl PackedHeaderKind {
+    /// Map a `VAEncPackedHeaderType` value (from the client's
+    /// `VAEncPackedHeaderParameterBuffer::type_` field) into our enum.
+    /// Returns `None` for misc/unknown types, which the client can still
+    /// send but which the H.264 passthrough path ignores.
+    pub fn from_va_type(ty: u32) -> Option<Self> {
+        // VAEncPackedHeaderMiscMask = 0x80000000; anything with that bit
+        // set is codec-misc metadata that we do not passthrough.
+        if ty & 0x8000_0000 != 0 {
+            return None;
+        }
+        match ty {
+            1 => Some(Self::Sequence),
+            2 => Some(Self::Picture),
+            3 => Some(Self::Slice),
+            4 => Some(Self::RawData),
+            _ => None,
+        }
+    }
+}
+
+/// Raw Annex-B NAL bytes as handed to us by the client via
+/// `VAEncPackedHeaderDataBufferType`, tagged with which NAL kind the
+/// preceding parameter buffer announced.
+#[derive(Debug, Clone)]
+pub struct PackedHeader {
+    pub kind: PackedHeaderKind,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Default)]
 pub struct PendingFrame {
     pub seq_param: Option<Vec<u8>>,
     pub pic_param: Option<Vec<u8>>,
     pub slice_param: Option<Vec<u8>>,
+    /// Legacy tuple form — kept for back-compat. New code should use
+    /// `packed_headers_typed`. Will be removed once all read sites switch.
     pub packed_headers: Vec<(u32, Vec<u8>)>,
+    /// Typed, ordered client-supplied packed headers. Built in
+    /// `render_picture` from (param, data) pairs and consumed in
+    /// `end_picture` as the authoritative SPS/PPS source when non-empty
+    /// (WebRTC/Chromium path).
+    pub packed_headers_typed: Vec<PackedHeader>,
+    /// Set when we see a `VAEncPackedHeaderParameterBufferType`; taken
+    /// and cleared when the paired `VAEncPackedHeaderDataBufferType`
+    /// arrives on the next render_picture call.
+    pub pending_packed_kind: Option<PackedHeaderKind>,
     pub coded_buf: Option<BufferKey>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PackedHeaderKind;
+
+    #[test]
+    fn packed_kind_maps_all_h264_variants() {
+        assert_eq!(PackedHeaderKind::from_va_type(1), Some(PackedHeaderKind::Sequence));
+        assert_eq!(PackedHeaderKind::from_va_type(2), Some(PackedHeaderKind::Picture));
+        assert_eq!(PackedHeaderKind::from_va_type(3), Some(PackedHeaderKind::Slice));
+        assert_eq!(PackedHeaderKind::from_va_type(4), Some(PackedHeaderKind::RawData));
+    }
+
+    #[test]
+    fn packed_kind_rejects_misc_and_unknown() {
+        // Misc mask: any type with 0x80000000 set.
+        assert_eq!(PackedHeaderKind::from_va_type(0x8000_0001), None);
+        assert_eq!(PackedHeaderKind::from_va_type(0xFFFF_FFFF), None);
+        // Unknown low-bits values.
+        assert_eq!(PackedHeaderKind::from_va_type(0), None);
+        assert_eq!(PackedHeaderKind::from_va_type(5), None);
+        assert_eq!(PackedHeaderKind::from_va_type(999), None);
+    }
 }
 
 /// Coded-bitstream output slot.
