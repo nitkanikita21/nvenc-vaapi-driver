@@ -1,156 +1,123 @@
-# libvaapi-rust-nvenc
+# nvenc-vaapi-driver
 
-Drop-in VAAPI encode backend для Linux, що надає H.264-кодування через NVIDIA NVENC застосункам, які використовують стандартний VAAPI-шлях (Discord, Chromium, OBS).
+A VAAPI backend driver for Linux that bridges the standard libva encode path to
+NVIDIA NVENC. Applications using `libva.so.2` — Chromium/Electron for WebRTC,
+OBS ffmpeg\_vaapi, `ffmpeg h264_vaapi`, gst-vaapi — get real GPU-accelerated
+H.264 encoding without any code changes, because NVIDIA ships no VAAPI encode
+driver of their own for Linux.
 
----
-
-## Проблема
-
-NVIDIA не постачає VAAPI encode driver для Linux. Офіційний `nvidia_drv_video.so` реалізує лише **decode** — він прокидає виклики через VDPAU і не має жодного encode entrypoint. Коли Chromium/Electron (Discord) запускається з прапорцями `--enable-features=AcceleratedVideoEncodeVaapi,VaapiVideoEncoder`, libva не знаходить `VAEntrypointEncSlice` і без попередження переходить на software encode. Результат: високе CPU-навантаження під час screenshare і обмежена якість.
-
-## Рішення
-
-`libvaapi-rust-nvenc` реалізує VAAPI backend з боку *сервера* (backend driver, а не клієнт). libva завантажує `.so` через стандартний `dlopen`-механізм і делегує encode-виклики напряму до NVIDIA Video Codec SDK (NVENC) через CUDA Driver API. З точки зору Chromium це звичайний VAAPI-драйвер — жодних змін у коді застосунку не потрібно.
-
-## Статус
-
-**Alpha / MVP.** Реалізовано:
-
-- H.264 encode: `VAProfileH264ConstrainedBaseline` та `VAProfileH264Main`, entrypoint `VAEntrypointEncSlice`
-- ABI-сумісність з libva 1.0–1.23 (усі 24 аліаси `__vaDriverInit_1_*`)
-- Повна `VADriverVTable` (config, surface, context, buffer, picture, sync, image stubs, export stub, display attrs)
-- Пресет-менеджер (bitrate/fps → NVENC P3/P4/P5 + CBR/CQP), реалізований та покритий тестами
-- NV12 DMA-BUF zero-copy вхід через `cuImportExternalMemory` (заглушка, підключення у наступній ітерації)
-
-**Non-goals першої ітерації:** decode, HEVC, AV1. Цей драйвер не замінює та не конфліктує з офіційним NVIDIA VAAPI backend.
+> **Status: Alpha / Work-in-Progress — not production ready.**
+> Core encode works and has been validated in real screenshare sessions, but the
+> driver has not been hardened against unusual pixel formats, multi-GPU setups, or
+> clients other than those listed below.
 
 ---
 
-## Вимоги
+## Hardware-Verified Working Setups
 
-| Компонент | Мінімальна версія |
+| Application | Encode path | Measured result |
+|---|---|---|
+| `ffmpeg h264_vaapi` | NV12 CPU upload via `hwupload` | 5.5x realtime on 1080p60 `testsrc2` |
+| OBS Studio (Advanced, FFmpeg VAAPI H.264) | ffmpeg VAAPI | Live encode to MP4; `enc` column in `nvidia-smi dmon` non-zero |
+| Vesktop (Electron Discord) WebRTC screen share | DMA-BUF zero-copy | `Encoder: VaapiVideoEncodeAccelerator`, `Power Efficient: Yes`, average encode time ~8 ms |
+
+All three were tested on Arch Linux, Hyprland/Wayland, RTX 4060, NVIDIA driver
+595.58.03, libva 2.22.
+
+---
+
+## Requirements
+
+| Component | Minimum version |
 |---|---|
-| Linux | будь-яке ядро з DRM/KMS |
-| NVIDIA driver | 525.x (NVENC SDK 12.0+, presets P3–P7) |
-| libva | 1.18 (runtime + headers, `va_drmcommon.h`) |
-| Rust (stable) | 1.85+ (edition 2024) |
-| clang / libclang-dev | будь-яка (потрібен bindgen для `va_backend.h`) |
-
-Перевірено на Arch Linux: NVIDIA driver 595.x, libva 2.22, RTX 4060.
-
-NVIDIA Video Codec SDK headers шукаються автоматично. Якщо вони не у стандартних системних шляхах:
-
-```bash
-export NVIDIA_VIDEO_CODEC_SDK_PATH=/opt/nvidia-video-codec-sdk
-```
+| Linux | Any kernel with DRM/KMS |
+| NVIDIA GPU | Any with NVENC (Kepler or newer) |
+| NVIDIA proprietary driver | 555.x or later recommended (NVENC SDK 12.2+) |
+| libva | 2.22 (runtime + headers) |
+| libva-utils | any (for `vainfo`) |
+| Rust stable | 1.85+ (edition 2024) |
+| clang / libclang | Any version (needed by `bindgen` at build time) |
 
 ---
 
-## Збірка
+## Build
+
+Install build dependencies:
 
 ```bash
 # Arch Linux
-sudo pacman -S libva libva-utils clang
+sudo pacman -S libva libva-utils clang rust
 
+# Ubuntu / Debian
+sudo apt install rustup libva-dev libva-utils clang libclang-dev
+```
+
+Build the driver:
+
+```bash
 cargo build --release
 ```
 
-Артефакт: `target/release/libnvidia_nvenc_drv_video.so`
+The output is `target/release/libnvidia_nvenc_drv_video.so`.
 
-Перевірити наявність export-символів:
+Cargo's `cdylib` target adds a `lib` prefix; libva expects the file without it.
+The install step below handles this automatically.
+
+Verify the ABI exports are present:
 
 ```bash
 nm -D target/release/libnvidia_nvenc_drv_video.so | grep __vaDriverInit
 ```
 
-Очікуваний результат — рядки від `__vaDriverInit_1_0` до `__vaDriverInit_1_23`.
-
-> Rust `cdylib` завжди додає префікс `lib`. libva очікує файл без нього:
-> `libnvidia_nvenc_drv_video.so` → встановлюється як `nvidia_nvenc_drv_video.so`.
+You should see entries from `__vaDriverInit_1_0` through `__vaDriverInit_1_23`.
+All 24 aliases resolve to the same init function, making this driver loadable by
+any libva 1.x minor version.
 
 ---
 
-## Інсталяція
+## Install and Configure
 
-### Без root (рекомендовано)
-
-```bash
-mkdir -p ~/.local/lib/dri
-cp target/release/libnvidia_nvenc_drv_video.so \
-   ~/.local/lib/dri/nvidia_nvenc_drv_video.so
-```
-
-### Системна (root)
+### Without root (recommended)
 
 ```bash
-sudo cp target/release/libnvidia_nvenc_drv_video.so \
-        /usr/lib/dri/nvidia_nvenc_drv_video.so
+bash tools/install-driver.sh
 ```
 
-Задайте змінні оточення (можна додати до `~/.bash_profile`, `~/.zprofile` або `~/.config/environment.d/vaapi.conf`):
+This copies the built `.so` to `~/.local/lib/dri/nvidia_nvenc_drv_video.so`
+(stripping the `lib` prefix that libva does not expect).
+
+Then set the two environment variables. Add them to `~/.bash_profile`,
+`~/.zprofile`, or `~/.config/environment.d/vaapi.conf` to make them permanent:
 
 ```bash
 export LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri"
 export LIBVA_DRIVER_NAME="nvidia_nvenc"
 ```
 
-libva формує ім'я файлу за правилом: `lib${LIBVA_DRIVER_NAME}_drv_video.so`.
+libva constructs the filename as `${LIBVA_DRIVER_NAME}_drv_video.so`, so the
+above pair resolves to `~/.local/lib/dri/nvidia_nvenc_drv_video.so`.
+
+### System-wide (requires root)
+
+```bash
+sudo cp target/release/libnvidia_nvenc_drv_video.so \
+        /usr/lib/dri/nvidia_nvenc_drv_video.so
+```
+
+Set `LIBVA_DRIVERS_PATH=/usr/lib/dri` and `LIBVA_DRIVER_NAME=nvidia_nvenc` as
+above.
 
 ---
 
-## Використання з Discord
+## Verify the Driver Loaded
 
 ```bash
 LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
-LIBVA_DRIVER_NAME="nvidia_nvenc" \
-discord \
-  --enable-features=AcceleratedVideoEncodeVaapi,VaapiVideoEncoder \
-  --disable-features=UseChromeOSDirectVideoDecoder \
-  --ozone-platform-hint=auto
-```
-
-Для Flatpak-версії Discord:
-
-```bash
-flatpak override --user \
-  --env=LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
-  --env=LIBVA_DRIVER_NAME="nvidia_nvenc" \
-  com.discordapp.Discord
-```
-
----
-
-## Використання з Chromium / Chrome
-
-```bash
-LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
-LIBVA_DRIVER_NAME="nvidia_nvenc" \
-chromium \
-  --enable-features=AcceleratedVideoEncodeVaapi,VaapiVideoEncoder \
-  --ozone-platform-hint=auto
-```
-
-Після запуску відкрийте `chrome://gpu` і знайдіть рядок:
-
-```
-Video Encode: Hardware accelerated
-```
-
-У розділі "Video Acceleration Information" має бути рядок `Encode h264`.
-
----
-
-## Верифікація
-
-### vainfo
-
-```bash
-LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
-LIBVA_DRIVER_NAME="nvidia_nvenc" \
+LIBVA_DRIVER_NAME=nvidia_nvenc \
 vainfo
 ```
 
-Очікуваний вивід (скорочено):
+Expected output (abbreviated):
 
 ```
 libva info: VA-API version 1.23.0
@@ -164,116 +131,321 @@ vainfo: Supported profile and entrypoints
       VAProfileH264Main               : VAEntrypointEncSlice
 ```
 
-Якщо рядків `VAEntrypointEncSlice` немає — драйвер не завантажився. Дивіться розділ Troubleshooting.
+If `VAEntrypointEncSlice` is absent the driver did not load — check the
+Troubleshooting section below.
 
-### Навантаження NVENC під час encode
+---
+
+## What You Can Test Right Now
+
+### (a) ffmpeg smoke encode
+
+Build and install the driver, then run:
+
+```bash
+LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
+LIBVA_DRIVER_NAME=nvidia_nvenc \
+ffmpeg \
+  -f lavfi -i "testsrc2=size=1920x1080:rate=60:duration=5" \
+  -vaapi_device /dev/dri/renderD128 \
+  -vf "format=nv12,hwupload" \
+  -c:v h264_vaapi -profile:v main -b:v 5M \
+  /tmp/nvenc_test.mp4
+```
+
+Verify the result:
+
+```bash
+ffprobe -v error -show_streams /tmp/nvenc_test.mp4
+```
+
+Look for `codec_name: h264` and a non-zero `nb_frames`. While encoding, check
+GPU utilisation:
 
 ```bash
 nvidia-smi dmon -s u
 ```
 
-Стовпець `enc` повинен бути ненульовим під час активного screenshare. Якщо він дорівнює 0 — Chromium використовує software fallback.
+The `enc` column should read 60% or higher for 1080p60 input.
 
----
-
-## Архітектура (огляд)
-
-```
-Chromium / Discord (Electron)
-        |  VAAPI client calls
-        v
-   libva.so.2
-        |  dlopen("nvidia_nvenc_drv_video.so")
-        |  dlsym("__vaDriverInit_1_23")
-        v
-+-----------------------------------------------+
-|       libnvidia_nvenc_drv_video.so             |
-|                                                |
-|   VA frontend          NVENC backend           |
-|   (vtable impl,        (NVIDIA Video Codec     |
-|    ID pools/slotmap,   SDK + CUDA Driver API,  |
-|    stream builder)     DMA-BUF import)         |
-+-----------------------------------------------+
-        |
-        v
-  libnvidia-encode.so  +  libcuda.so
-```
-
-Два шляхи передачі вхідного кадру:
-
-**Внутрішні NV12 surfaces** — `cuMemAllocPitch` → `NvEncRegisterResource(CUDADEVICEPTR)` → `NvEncEncodePicture`.
-
-**DMA-BUF zero-copy** — compositor передає DRM PRIME fd → `cuImportExternalMemory(OPAQUE_FD)` → `NvEncRegisterResource(CUDAARRAY)` → encode без CPU-копіювання.
-
-Детальніша документація для контрибьюторів: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
----
-
-## Тестування
-
-Запустити всі unit-тести (не потребують GPU):
-
-```bash
-cargo test --workspace --release
-```
-
-End-to-end тести (потрібен GPU + встановлений драйвер):
+To run the project's own automated smoke test (requires `ffmpeg` and
+`ffprobe` on `PATH` and an NVIDIA GPU at `/dev/dri/renderD128`):
 
 ```bash
 LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
-LIBVA_DRIVER_NAME="nvidia_nvenc" \
-cargo test --workspace --release -- --include-ignored vainfo
+LIBVA_DRIVER_NAME=nvidia_nvenc \
+cargo test --test encode_ffmpeg --release -- --ignored --nocapture
 ```
 
-Smoke-encode тест (записує `out.h264`, перевіряє через `ffprobe`):
+### (b) OBS Studio
+
+1. Set the environment variables before launching OBS:
 
 ```bash
-cargo test --release encode_nv12
+LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
+LIBVA_DRIVER_NAME=nvidia_nvenc \
+obs
+```
+
+2. In OBS: **Settings > Output > Output Mode: Advanced > Encoder: FFmpeg VAAPI
+   H.264**.
+3. Start a recording or stream. In `nvidia-smi dmon -s u` the `enc` column
+   should be non-zero.
+
+OBS will fall back to CPU-side upload (`vaPutImage` path) if the DMA-BUF path
+is unavailable, so it works without PipeWire capture as well.
+
+### (c) Vesktop (Electron Discord) WebRTC screen share
+
+Chromium-based Electron apps have three runtime feature gates that must all be
+enabled simultaneously for the VAAPI encode path to activate. They are all
+disabled by default in upstream Chromium. Vesktop (which is built with VAAPI
+encoding enabled at compile time) can be unlocked with:
+
+```bash
+LIBVA_DRIVERS_PATH="$HOME/CODING/libvaapi-rust-nvenc/target/release" \
+LIBVA_DRIVER_NAME=nvidia_nvenc \
+vesktop \
+  --enable-features=AcceleratedVideoEncoder,VaapiVideoEncoder,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks,WebRtcPipeWireCapturer \
+  --ignore-gpu-blocklist \
+  --disable-gpu-driver-bug-workarounds \
+  --disable-gpu-sandbox \
+  --no-sandbox \
+  --ozone-platform=x11
+```
+
+Also set `hardwareVideoAcceleration: true` in
+`~/.config/vesktop/settings.json`, because Vesktop rebuilds the feature flag set
+at startup and only includes `AcceleratedVideoEncoder` when that setting is on:
+
+```json
+{ "hardwareVideoAcceleration": true }
+```
+
+Once in a voice channel with screen share active, open Vesktop's debug overlay.
+You should see:
+
+```
+Encoder: VaapiVideoEncodeAccelerator
+Power Efficient: Yes
+Average Encode Time: ~8ms
+```
+
+The three Chromium gates that must be enabled are:
+
+- `AcceleratedVideoEncoder` — the main hardware encode gate (the C++ symbol is
+  `kAcceleratedVideoEncodeLinux` but the feature string has no `Linux` suffix).
+- `VaapiOnNvidiaGPUs` — bypasses Chromium's default NVIDIA block (the upstream
+  comment reads: "NVIDIA VA-API drivers do not support Chromium and can sometimes
+  cause crashes, disable VA-API on NVIDIA GPUs by default").
+- `VaapiIgnoreDriverChecks` — skips vendor string validation that would
+  otherwise reject our `nvidia_nvenc-rs` driver name.
+
+`--disable-gpu-sandbox` and `--no-sandbox` are required because the GPU sandbox
+prevents the GPU process from opening `/dev/dri/renderD128` and from inheriting
+`LIBVA_*` environment variables. `--ozone-platform=x11` avoids a separate
+Wayland/Electron issue where `vaGetDisplay` returns an invalid display inside
+the GPU subprocess.
+
+---
+
+## Why Stock Chromium and Google Chrome on Linux Do Not Work
+
+Google Chrome and the Arch Linux `chromium` package are built without
+`enable_hardware_h264_encoding_on_linux=true`. This is a **compile-time** flag,
+not a runtime one. No `--enable-features` flag, no `chrome://flags` entry, and
+no environment variable can override it. Even with the full set of Vesktop flags
+above, `chrome://gpu` will show `Video Encode: Software only` and `Problems
+Detected: video_encode` in disabled features.
+
+Electron 40 (the version bundled in Vesktop) is built with the flag on, which is
+why Vesktop works and stock Chrome/Chromium do not. This is an upstream build
+decision, not a deficiency in this driver.
+
+---
+
+## Known Limitations
+
+- **Multi-object DMA-BUF** (separate file descriptors for the Y and UV planes)
+  is not supported. The driver returns `VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE`.
+  This layout is rare in practice; Chromium/PipeWire uses single-object NV12.
+- **BGRA/ARGB DMA-BUF** input is not supported. Converting to NV12 on the GPU
+  would require a CUDA PTX colour-conversion kernel. Deferred.
+- **`vaExportSurfaceHandle`** (the inverse path — exporting an NVENC surface as
+  a DMA-BUF for the client) is not implemented. OBS attempts it for a
+  texture-sharing optimisation, then falls back to CPU upload via `vaPutImage`,
+  which works correctly.
+- **Decode, HEVC, AV1** are non-goals of this project. The driver advertises
+  only `VAEntrypointEncSlice`.
+- **Multi-object DMA-BUF** and colour conversion to NV12 are deferred.
+- **Stock Google Chrome / Arch chromium** are incompatible by upstream build
+  choice (`enable_hardware_h264_encoding_on_linux=false`), not a driver bug.
+
+---
+
+## Architecture Overview
+
+```
+Chromium / Discord (Electron) / OBS / ffmpeg
+        |   VAAPI client API (vaInitialize, vaCreateConfig, vaBeginPicture, ...)
+        v
+   libva.so.2  (system)
+        |   dlopen("$LIBVA_DRIVERS_PATH/nvidia_nvenc_drv_video.so")
+        |   dlsym("__vaDriverInit_1_23")
+        v
++------------------------------------------------------------------+
+|              libnvidia_nvenc_drv_video.so                        |
+|                                                                  |
+|   src/lib.rs                                                     |
+|   __vaDriverInit_1_{0..23}  (24 aliases, all -> driver_init)    |
+|                                                                  |
+|   driver/config.rs     vaCreateConfig / vaQueryConfigProfiles    |
+|   driver/surface.rs    vaCreateSurfaces / DMA-BUF import        |
+|   driver/context.rs    vaCreateContext                           |
+|   driver/buffer.rs     vaCreateBuffer / vaMapBuffer             |
+|   driver/picture.rs    vaBeginPicture / vaRenderPicture /        |
+|                        vaEndPicture (rate-control reconfigure)   |
+|   driver/sync.rs       vaSyncSurface / vaSyncBuffer             |
+|                                                                  |
+|   nvenc/session.rs     NvencSession: map-encode-lock-unmap cycle |
+|   nvenc/preset.rs      bitrate/fps -> NVENC preset/tuning/RC    |
+|   nvenc/h264_config.rs apply_config() mutates NV_ENC_CONFIG     |
+|   cuda/external_mem.rs cuImportExternalMemory (DMA-BUF path)    |
++------------------------------------------------------------------+
+        |
+        v
+   libnvidia-encode.so  +  libcuda.so
+        |
+        v
+   NVIDIA GPU (NVENC engine)
+```
+
+Two frame input paths:
+
+- **Internal NV12 surfaces** — `cuMemAllocPitch` allocates an NV12 buffer in
+  CUDA device memory. The client uploads pixels via `vaPutImage`
+  (`cuMemcpy2D_v2`), then `NvEncRegisterResource(CUDADEVICEPTR)` hands it to
+  NVENC. Used by ffmpeg `hwupload` and OBS.
+- **DMA-BUF zero-copy** — the compositor passes a DRM PRIME file descriptor.
+  `cuImportExternalMemory(OPAQUE_FD)` maps it into the CUDA address space as a
+  mipmapped array. `NvEncRegisterResource(CUDAARRAY)` registers it with NVENC
+  without any CPU copy. Used by Chromium/PipeWire screen share.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed design document.
+
+---
+
+## Project Status and Roadmap
+
+### Working
+
+- H.264 encode: `VAProfileH264ConstrainedBaseline` and `VAProfileH264Main`
+- ABI compatibility with libva 1.0 through 1.23 (all 24 `__vaDriverInit_1_*`
+  aliases)
+- Internal NV12 surfaces via `cuMemAllocPitch` + `NvEncRegisterResource`
+- DMA-BUF zero-copy surface import via `cuImportExternalMemory`
+- Dynamic rate-control and framerate reconfiguration per-frame via
+  `VAEncMiscParameterBufferType` (Chromium WebRTC `RateController` path)
+- 6-slot bitstream output pool with `NV_ENC_ERR_NEED_MORE_INPUT` handling
+- `catch_unwind` at every `extern "C"` boundary (panics return
+  `VA_STATUS_ERROR_UNKNOWN` instead of crossing the FFI boundary)
+
+### Deferred
+
+- Multi-object DMA-BUF (separate Y and UV file descriptors)
+- BGRA/ARGB DMA-BUF input (needs PTX colour-conversion kernel)
+- `vaExportSurfaceHandle` inverse path
+- `VAProfileH264High` (struct is wired; session config needs testing)
+- Decode, HEVC, AV1
+
+---
+
+## Testing
+
+Run all unit tests (no GPU required):
+
+```bash
+cargo test
+```
+
+Run the ignored integration tests (requires NVIDIA GPU, `ffmpeg h264_vaapi`,
+`ffprobe`):
+
+```bash
+LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
+LIBVA_DRIVER_NAME=nvidia_nvenc \
+cargo test --test encode_ffmpeg --release -- --ignored --nocapture
+```
+
+Run the `vainfo` smoke test (requires the driver installed and `vainfo` on PATH):
+
+```bash
+LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
+LIBVA_DRIVER_NAME=nvidia_nvenc \
+cargo test --release -- --ignored vainfo
+```
+
+Or without installing, directly from the build directory:
+
+```bash
+./tools/run-vainfo.sh
 ```
 
 ---
 
 ## Troubleshooting
 
-### Неправильний драйвер або драйвер не завантажується
+**Driver not loading / vainfo shows no entrypoints**
 
-Увімкніть трасування libva:
+Enable libva trace logging:
 
 ```bash
-LIBVA_TRACE=/tmp/va \
+LIBVA_MESSAGING_LEVEL=2 \
 LIBVA_DRIVERS_PATH="$HOME/.local/lib/dri" \
-LIBVA_DRIVER_NAME="nvidia_nvenc" \
+LIBVA_DRIVER_NAME=nvidia_nvenc \
 vainfo
 ```
 
-Перевірте `/tmp/va.log` — видно, який `.so` фактично відкрито і чи знайдено символ `__vaDriverInit`.
-
-Переконайтесь, що файл встановлено **без** префікса `lib`:
+The output will show which `.so` was opened and whether the `__vaDriverInit`
+symbol was found. Also confirm the file exists without the `lib` prefix:
 
 ```bash
 ls -la ~/.local/lib/dri/nvidia_nvenc_drv_video.so
 ```
 
-### Permission denied на `/dev/nvidia*`
+**Permission denied on `/dev/dri/renderD128`**
 
 ```bash
-ls -la /dev/nvidia*
-# Додати користувача до групи video:
-sudo usermod -aG video $USER
+ls -la /dev/dri/renderD128
+# Add yourself to the render and/or video group:
+sudo usermod -aG render,video "$USER"
+# Then log out and back in.
 ```
 
-### Wayland + PipeWire: format mismatch
+**Chromium / Vesktop falls back to software encode**
 
-Деякі compositors надсилають BGRA DMA-BUF замість NV12. Драйвер виконує конвертацію BGRA→NV12 через вбудований CUDA PTX kernel. Якщо виникає помилка під час `vaCreateSurfaces2`, переконайтесь, що compositor підтримує `GBM_FORMAT_NV12` export.
+1. Confirm `vainfo` shows `VAEntrypointEncSlice`.
+2. Check that all three feature flags (`AcceleratedVideoEncoder`,
+   `VaapiOnNvidiaGPUs`, `VaapiIgnoreDriverChecks`) appear in the command line
+   (`chrome://version` > Command Line).
+3. Confirm `~/.config/vesktop/settings.json` contains
+   `"hardwareVideoAcceleration": true`.
+4. Add `--vmodule=vaapi*=3` to the launch command for detailed VAAPI logs in
+   stderr.
 
-### Chromium повертається до software encode
+**`nvidia-smi dmon` enc column stays at 0**
 
-1. Переконайтесь, що `vainfo` успішно виводить `VAEntrypointEncSlice`.
-2. Перевірте `chrome://version` → Command Line — обидва прапорці `AcceleratedVideoEncodeVaapi` і `VaapiVideoEncoder` мають бути присутні.
-3. Запустіть з `--vmodule=vaapi*=3` для детального логування VAAPI у stderr.
+The client is using software encode. Revisit the driver load steps above.
 
 ---
 
-## Ліцензія
+## Contributing
 
-TBD — see LICENSE.
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for build instructions, test
+commands, code quality requirements, and workspace layout.
+
+---
+
+## License
+
+MIT — see [LICENSE-MIT](LICENSE-MIT).
