@@ -216,29 +216,21 @@ pub unsafe extern "C" fn end_picture(
             .as_mut()
             .ok_or(DriverError::OperationFailed("no NVENC session — GPU init failed"))?;
 
-        // Apply MISC parameter updates first. Chromium's WebRTC
-        // RateController delivers its target bitrate/framerate through
-        // VAEncMiscParameterBufferType on every frame; we must reconfigure
-        // NVENC to honour those targets, otherwise WebRTC marks us as an
-        // encoder that ignores bitrate commands and cycles us out.
-        if misc_bitrate.is_some() || misc_fps.is_some() {
-            let mut new_cfg = *session.config();
-            if let Some(bps) = misc_bitrate {
-                new_cfg.bitrate_bps = bps;
-            }
-            if let Some((num, den)) = misc_fps {
-                new_cfg.fps_num = num;
-                new_cfg.fps_den = den.max(1);
-            }
-            if new_cfg != *session.config() {
-                // No forced IDR: WebRTC's RateController sends updated
-                // bitrate targets on every frame; forcing IDR on each one
-                // produces an all-keyframe stream which WebRTC flags as a
-                // malfunctioning encoder and cycles out after ~4 trial
-                // frames. Bitrate/framerate updates take effect mid-GOP.
-                let _ = session.reconfigure(new_cfg, false);
-            }
-        }
+        // Chromium's WebRTC RateController publishes a fresh target
+        // bitrate and framerate on every frame via VAEncMiscParameter.
+        // We parse them into `misc_bitrate` / `misc_fps` above, but we
+        // deliberately do NOT pipe them into NvEncReconfigureEncoder:
+        // the values drift by a few bps/fps on every tick, and even
+        // "soft" reconfigures (force_idr=false, resetEncoder=0) appear
+        // to disturb NVENC's internal rate-control state enough that
+        // Chromium's VaapiVideoEncodeAccelerator stops producing valid
+        // output dimensions after ~4 frames. An earlier well-tested
+        // revision of this driver (pre-4d44688) ignored these buffers
+        // entirely and that is empirically what WebRTC tolerates best.
+        // Re-enable this only when we can verify NVENC accepts a
+        // continuous stream of per-frame rc deltas without degrading.
+        let _ = misc_bitrate;
+        let _ = misc_fps;
 
         if let Some(sps_bytes) = seq_bytes.as_deref() {
             if let Some(sps_view) = h264::parse_sps(sps_bytes) {
