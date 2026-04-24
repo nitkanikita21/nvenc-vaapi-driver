@@ -59,8 +59,28 @@ pub unsafe extern "C" fn create_context(
         // at vaCreateConfig, so the lookup below should always succeed.
         let profile = pools.configs[cfg_key].profile;
         let h264_profile = h264_profile_from_va(profile).unwrap_or(H264Profile::Main);
-        let width = u32::try_from(picture_width).map_err(|_| DriverError::InvalidParameter)?;
-        let height = u32::try_from(picture_height).map_err(|_| DriverError::InvalidParameter)?;
+        let mut width = u32::try_from(picture_width).unwrap_or(0);
+        let mut height = u32::try_from(picture_height).unwrap_or(0);
+        // Chromium's WebRTC VaapiVideoEncodeAccelerator calls vaCreateContext
+        // with picture_width/height = 0 (libva treats 0 as "derive from render
+        // targets"). Without this fallback NVENC gets initialised at 0×0, the
+        // H.264 SPS it emits has zero picture dimensions, and Chromium's
+        // `VideoFrame::coded_size()` parses as (0,0) → the WebRTC debug overlay
+        // shows "undefined × undefined" and the encoder gets cycled out after
+        // ~4 trial frames. Ground truth: the first render-target surface.
+        if (width == 0 || height == 0) && !targets.is_empty() {
+            if let Some(first) = pools.surfaces.get(targets[0]) {
+                if width == 0 {
+                    width = first.width;
+                }
+                if height == 0 {
+                    height = first.height;
+                }
+            }
+        }
+        if width == 0 || height == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
         let draft_cfg = EncoderConfig::default_for(width, height, h264_profile);
 
         // Eagerly bring up a NVENC session. On hosts without a GPU we log
