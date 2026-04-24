@@ -181,6 +181,15 @@ pub struct PendingFrame {
     /// arrives on the next render_picture call.
     pub pending_packed_kind: Option<PackedHeaderKind>,
     pub coded_buf: Option<BufferKey>,
+    /// Dynamic bitrate target (bps) received via
+    /// `VAEncMiscParameterTypeRateControl` during render_picture.
+    /// Consumed in end_picture to reconfigure the NVENC session.
+    /// Critical for WebRTC: Chromium's RateController sends this on
+    /// every frame and penalises encoders that ignore it.
+    pub misc_bitrate_bps: Option<u32>,
+    /// Dynamic target framerate, `fps_num / fps_den`, from
+    /// `VAEncMiscParameterTypeFrameRate`.
+    pub misc_fps: Option<(u32, u32)>,
 }
 
 #[cfg(test)]

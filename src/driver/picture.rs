@@ -109,10 +109,60 @@ pub unsafe extern "C" fn render_picture(
                     pending.packed_headers.push((brec.buf_type, data));
                 }
                 va::VAEncCodedBufferType => pending.coded_buf = Some(bk),
+                va::VAEncMiscParameterBufferType => {
+                    // Layout: u32 `type_` followed by subtype struct.
+                    // Chromium/WebRTC uses this channel heavily to drive
+                    // dynamic bitrate (RateControl, type=1) and
+                    // framerate (type=0) changes. Ignoring it means
+                    // NVENC stays on our default bitrate regardless of
+                    // what Chromium's RateController asked for — the
+                    // root cause of the 4-frame-then-cycle behaviour
+                    // observed in Vesktop screen share.
+                    if data.len() < core::mem::size_of::<u32>() {
+                        continue;
+                    }
+                    let mut misc_type_bytes = [0u8; 4];
+                    misc_type_bytes.copy_from_slice(&data[..4]);
+                    let misc_type = u32::from_ne_bytes(misc_type_bytes);
+                    match misc_type {
+                        // VAEncMiscParameterTypeFrameRate = 0: next u32
+                        // packs framerate as `num | (den << 16)` (libva
+                        // convention when the 16 low bits are non-zero;
+                        // older libvas treat the whole word as numerator
+                        // with den=1).
+                        0 => {
+                            if data.len() >= 8 {
+                                let mut b = [0u8; 4];
+                                b.copy_from_slice(&data[4..8]);
+                                let raw = u32::from_ne_bytes(b);
+                                let num = raw & 0xFFFF;
+                                let den = (raw >> 16).max(1);
+                                if num > 0 {
+                                    pending.misc_fps = Some((num, den));
+                                }
+                            }
+                        }
+                        // VAEncMiscParameterTypeRateControl = 1: next u32
+                        // is `bits_per_second`.
+                        1 => {
+                            if data.len() >= 8 {
+                                let mut b = [0u8; 4];
+                                b.copy_from_slice(&data[4..8]);
+                                let bps = u32::from_ne_bytes(b);
+                                if bps > 0 {
+                                    pending.misc_bitrate_bps = Some(bps);
+                                }
+                            }
+                        }
+                        _ => {
+                            // HRD, MaxSliceSize, AIR, MaxFrameSize, etc.
+                            // Not yet modeled — NVENC will operate on
+                            // the current rate-control state.
+                        }
+                    }
+                }
                 _ => {
-                    // Accept unknown parameter buffers silently – many clients
-                    // pass misc buffers (framerate, HRD, etc.) that we do not
-                    // need to model until we enable the real NVENC path.
+                    // Unknown buffer type — accept silently.
                 }
             }
         }
@@ -141,6 +191,8 @@ pub unsafe extern "C" fn end_picture(
         let coded_buf_key = pending.coded_buf.take();
         let packed_headers: Vec<crate::driver::state::PackedHeader> =
             core::mem::take(&mut pending.packed_headers_typed);
+        let misc_bitrate = pending.misc_bitrate_bps.take();
+        let misc_fps = pending.misc_fps.take();
         pending.slice_param = None;
         pending.packed_headers.clear();
         pending.pending_packed_kind = None;
@@ -163,6 +215,27 @@ pub unsafe extern "C" fn end_picture(
         let session = session_guard
             .as_mut()
             .ok_or(DriverError::OperationFailed("no NVENC session — GPU init failed"))?;
+
+        // Apply MISC parameter updates first. Chromium's WebRTC
+        // RateController delivers its target bitrate/framerate through
+        // VAEncMiscParameterBufferType on every frame; we must reconfigure
+        // NVENC to honour those targets, otherwise WebRTC marks us as an
+        // encoder that ignores bitrate commands and cycles us out.
+        if misc_bitrate.is_some() || misc_fps.is_some() {
+            let mut new_cfg = *session.config();
+            if let Some(bps) = misc_bitrate {
+                new_cfg.bitrate_bps = bps;
+            }
+            if let Some((num, den)) = misc_fps {
+                new_cfg.fps_num = num;
+                new_cfg.fps_den = den.max(1);
+            }
+            if new_cfg != *session.config() {
+                // forceIDR is already set inside `reconfigure`, so the new
+                // bitrate takes effect on the very next encoded frame.
+                let _ = session.reconfigure(new_cfg);
+            }
+        }
 
         if let Some(sps_bytes) = seq_bytes.as_deref() {
             if let Some(sps_view) = h264::parse_sps(sps_bytes) {

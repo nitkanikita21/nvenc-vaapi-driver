@@ -123,9 +123,19 @@ pub fn apply_config(preset_cfg: &mut nv::NV_ENC_CONFIG, cfg: &EncoderConfig) {
             rc.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
             rc.averageBitRate = cfg.bitrate_bps;
             rc.maxBitRate = cfg.bitrate_bps;
-            let per = per_frame_bits(cfg.bitrate_bps, cfg.fps_num, cfg.fps_den);
-            rc.vbvBufferSize = per;
-            rc.vbvInitialDelay = per;
+            // VBV = 1 second of bitrate. An earlier iteration used
+            // `per_frame_bits` (1 frame = ~500 bytes at 244 Kbps/60 fps),
+            // which starved NVENC: an IDR at 1080p needs ~20 KB and NVENC
+            // then either dropped frames or produced fragments — which
+            // WebRTC diagnosed as a failing encoder and switched back to
+            // OpenH264 after its 8-frame trial window. 1 second is the
+            // standard low-latency real-time buffer used by x264/libvpx
+            // (`bitrate == buffer-size`).
+            rc.vbvBufferSize = cfg.bitrate_bps;
+            // Initial delay = half buffer — starts half-full, so the first
+            // IDR can borrow up to half-buffer worth of bits without
+            // underflowing the decoder.
+            rc.vbvInitialDelay = cfg.bitrate_bps / 2;
         }
         preset::RcMode::Vbr => {
             rc.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
@@ -234,9 +244,11 @@ mod tests {
         );
         assert_eq!(cfg.rcParams.averageBitRate, 5_000_000);
         assert_eq!(cfg.rcParams.maxBitRate, 5_000_000);
-        // 5 Mbps / 60 fps = 83_333 bits/frame.
-        assert_eq!(cfg.rcParams.vbvBufferSize, 83_333);
-        assert_eq!(cfg.rcParams.vbvInitialDelay, 83_333);
+        // VBV = 1 second of bitrate (low-latency real-time convention);
+        // initial delay = half that. Earlier iteration used per-frame
+        // buffer which starved NVENC at low Kbps WebRTC targets.
+        assert_eq!(cfg.rcParams.vbvBufferSize, 5_000_000);
+        assert_eq!(cfg.rcParams.vbvInitialDelay, 2_500_000);
         // SAFETY: union set to h264 by apply_config.
         let h264 = unsafe { &cfg.encodeCodecConfig.h264Config };
         assert_eq!(h264.sliceMode, 3);
@@ -318,8 +330,8 @@ mod tests {
         };
         apply_config(&mut cfg, &ec);
         assert_eq!(cfg.gopLength, 1);
-        // 500_000 * 1001 / 24_000 = 20_854 (floor).
-        assert_eq!(cfg.rcParams.vbvBufferSize, 20_854);
+        // VBV = 1 s of bitrate (500 Kbps).
+        assert_eq!(cfg.rcParams.vbvBufferSize, 500_000);
         // SAFETY: union resolved.
         let h264 = unsafe { &cfg.encodeCodecConfig.h264Config };
         assert_eq!(h264.idrPeriod, 1);
@@ -371,7 +383,8 @@ mod tests {
         apply_config(&mut cfg, &ec);
         assert_eq!(cfg.rcParams.averageBitRate, 10_000_000);
         assert_eq!(cfg.rcParams.maxBitRate, 10_000_000);
-        assert_eq!(cfg.rcParams.vbvBufferSize, 166_666); // 10M / 60 (floor)
-        assert_eq!(cfg.rcParams.vbvInitialDelay, 166_666);
+        // VBV = 1 s of bitrate; initial delay = 500 ms.
+        assert_eq!(cfg.rcParams.vbvBufferSize, 10_000_000);
+        assert_eq!(cfg.rcParams.vbvInitialDelay, 5_000_000);
     }
 }
