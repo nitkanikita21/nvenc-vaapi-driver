@@ -272,6 +272,80 @@ impl NvencSession {
         Ok(())
     }
 
+    /// Register a DMA-BUF-imported CUarray with the encoder.
+    ///
+    /// Mirrors [`register_internal_surface`] but uses
+    /// `NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY`. NVENC determines pitch from
+    /// the CUDA array itself; we still pass width/height for its bookkeeping.
+    ///
+    /// Idempotent per `key`.
+    pub fn register_external_surface(
+        &mut self,
+        key: SurfaceKey,
+        cuda_array: cudarc::driver::sys::CUarray,
+        width: u32,
+        height: u32,
+    ) -> Result<nv::NV_ENC_REGISTERED_PTR, DriverError> {
+        if let Some(existing) = self.registered.get(&key) {
+            return Ok(existing.registered_ptr);
+        }
+        let api = match catch_unwind(AssertUnwindSafe(|| &*ENCODE_API)) {
+            Ok(a) => a,
+            Err(_) => return Err(DriverError::OperationFailed("ENCODE_API unavailable")),
+        };
+        let mut params: nv::NV_ENC_REGISTER_RESOURCE = unsafe {
+            MaybeUninit::zeroed().assume_init()
+        };
+        params.version = nv::NV_ENC_REGISTER_RESOURCE_VER;
+        params.resourceType =
+            nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY;
+        params.width = width;
+        params.height = height;
+        // For CUDAARRAY NVENC derives pitch from the array descriptor;
+        // passing 0 tells it to do exactly that.
+        params.pitch = 0;
+        params.resourceToRegister = cuda_array as *mut c_void;
+        params.bufferFormat = nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12;
+        params.bufferUsage = nv::NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE;
+        // SAFETY: encoder valid, params versioned, cuda_array is a live
+        // CUarray whose lifetime outlives this session (owned by the
+        // SurfaceRec's ExternalDmaBufImage).
+        let s = unsafe { (api.register_resource)(self.encoder, &mut params) };
+        if s != nv::NVENCSTATUS::NV_ENC_SUCCESS {
+            return Err(DriverError::OperationFailed("NvEncRegisterResource(CUDAARRAY)"));
+        }
+        let registered_ptr = params.registeredResource;
+        self.registered.insert(
+            key,
+            RegisteredSurface {
+                registered_ptr,
+                width,
+                height,
+                // Pitch unused on the CUDAARRAY path but kept for the
+                // shared struct layout.
+                pitch: 0,
+            },
+        );
+        Ok(registered_ptr)
+    }
+
+    /// Best-effort NVENC unregister for a previously-registered surface.
+    /// Used when a DMA-BUF-backed surface is destroyed so we tear down the
+    /// NVENC-side registration before CUDA drops the underlying mipmap.
+    pub fn unregister_surface(&mut self, key: SurfaceKey) {
+        let Some(reg) = self.registered.remove(&key) else {
+            return;
+        };
+        let Ok(api) = catch_unwind(AssertUnwindSafe(|| &*ENCODE_API)) else {
+            return;
+        };
+        // SAFETY: registered_ptr came from a successful RegisterResource
+        // against this encoder and has not been unregistered yet.
+        unsafe {
+            let _ = (api.unregister_resource)(self.encoder, reg.registered_ptr);
+        }
+    }
+
     /// Encode one frame and return the resulting bitstream (possibly empty
     /// if NVENC deferred output).
     pub fn encode_frame(

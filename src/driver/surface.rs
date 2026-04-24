@@ -5,9 +5,11 @@
 //! The `kind` field tracks whether backing memory is a CUDA device allocation,
 //! an imported DMA-BUF fd, or a placeholder stub.
 //!
-//! The DMA-BUF zero-copy path (parsing `VASurfaceAttribExternalBuffers` with
-//! `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` and calling `cuImportExternalMemory`)
-//! is not yet implemented; `create_surfaces2` currently allocates `Stub` entries.
+//! The DMA-BUF zero-copy path parses `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`
+//! from the attribute list, reads the paired `VASurfaceAttribExternalBufferDescriptor`,
+//! and imports the fd into CUDA through [`crate::cuda::external_mem`].
+//! Registration with NVENC is deferred to first encode (see
+//! `driver::picture::end_picture`).
 
 use super::{guard, state_from};
 use crate::driver::state::{SurfaceKind, SurfaceRec};
@@ -60,27 +62,26 @@ pub unsafe extern "C" fn create_surfaces2(
         if format != va::VA_RT_FORMAT_YUV420 {
             return Err(DriverError::UnsupportedRtFormat);
         }
-        // DRM_PRIME_2 import — slice d. Явно відкидаємо із UNSUPPORTED_MEMORY_TYPE,
-        // щоб клієнт зміг fallback-нутись на INTERNAL allocation.
-        if !attrib_list.is_null() && num_attribs > 0 {
+        // Parse attribute list: look for DRM_PRIME_2 memory type + the
+        // paired VASurfaceAttribExternalBufferDescriptor that actually
+        // carries the DMA-BUF fds.
+        let attribs: &[va::VASurfaceAttrib] = if !attrib_list.is_null() && num_attribs > 0 {
             // SAFETY: client-provided array of `num_attribs` VASurfaceAttrib.
-            let attribs = unsafe {
-                core::slice::from_raw_parts(attrib_list, num_attribs as usize)
-            };
-            for a in attribs {
-                if a.type_ == va::VASurfaceAttribMemoryType {
-                    // SAFETY: VAGenericValue.value — union; `i` валідний
-                    // варіант (MemoryType завжди int).
-                    let mem_type = unsafe { *a.value.value.i.as_ref() } as u32;
-                    if mem_type == va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 {
-                        crate::logging::info(
-                            ctx,
-                            "create_surfaces2: DRM_PRIME_2 import not yet supported (slice d)",
-                        );
-                        return Err(DriverError::UnsupportedMemory);
-                    }
-                }
-            }
+            unsafe { core::slice::from_raw_parts(attrib_list, num_attribs as usize) }
+        } else {
+            &[]
+        };
+        let (want_drm_prime_2, prime_desc_ptr) = parse_drm_prime_attribs(attribs);
+        if want_drm_prime_2 {
+            let _ = (width, height); // dimensions come from the descriptor
+            return create_surfaces2_dma_buf(
+                ctx,
+                state,
+                format,
+                surfaces,
+                num_surfaces,
+                prime_desc_ptr,
+            );
         }
         // Try to allocate CUDA-resident NV12 storage for each surface. If
         // CUDA init fails (no GPU on this host), fall back to `Stub` so the
@@ -156,6 +157,112 @@ fn allocate_nv12(
     Ok((dptr as u64, pitch_u32))
 }
 
+/// Scan the client's `VASurfaceAttrib` list for the DMA-BUF import pair:
+/// `VASurfaceAttribMemoryType == DRM_PRIME_2` plus the external-buffer
+/// descriptor pointer.
+///
+/// Returned flag is true iff the client *asked* for DRM_PRIME_2. The
+/// pointer is `None` when the attribute list did not contain the paired
+/// external-buffer descriptor (invalid — `create_surfaces2_dma_buf` will
+/// reject it).
+fn parse_drm_prime_attribs(
+    attribs: &[va::VASurfaceAttrib],
+) -> (bool, Option<*const va::VADRMPRIMESurfaceDescriptor>) {
+    let mut want = false;
+    let mut desc: Option<*const va::VADRMPRIMESurfaceDescriptor> = None;
+    for a in attribs {
+        if a.type_ == va::VASurfaceAttribMemoryType {
+            // SAFETY: VAGenericValue is a bindgen union; MemoryType
+            // attributes always carry the `i` integer variant.
+            let mem_type = unsafe { *a.value.value.i.as_ref() } as u32;
+            if mem_type & va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0 {
+                want = true;
+            }
+        } else if a.type_ == va::VASurfaceAttribExternalBufferDescriptor {
+            // SAFETY: the external buffer descriptor attribute carries
+            // the `p` pointer variant per libva contract.
+            let p = unsafe { *a.value.value.p.as_ref() };
+            if !p.is_null() {
+                desc = Some(p as *const va::VADRMPRIMESurfaceDescriptor);
+            }
+        }
+    }
+    (want, desc)
+}
+
+/// DRM_PRIME_2 path: import each (already-dup'd) DMA-BUF from the caller's
+/// descriptor into CUDA via `cuImportExternalMemory`, wrap it in a
+/// `SurfaceKind::ExternalDmaBuf`, and hand back surface IDs.
+///
+/// On import failure we return `AllocFailed` rather than `UnsupportedMemory`
+/// so Chromium treats it as a retriable soft failure (fall back to its own
+/// buffer allocator) instead of concluding the driver lacks DRM_PRIME_2
+/// altogether and never offering zero-copy again.
+fn create_surfaces2_dma_buf(
+    ctx: va::VADriverContextP,
+    state: &crate::driver::state::DriverState,
+    format: u32,
+    surfaces: *mut va::VASurfaceID,
+    num_surfaces: u32,
+    prime_desc_ptr: Option<*const va::VADRMPRIMESurfaceDescriptor>,
+) -> Result<(), DriverError> {
+    let Some(desc_ptr) = prime_desc_ptr else {
+        crate::logging::error(
+            ctx,
+            "create_surfaces2: DRM_PRIME_2 requested without ExternalBufferDescriptor",
+        );
+        return Err(DriverError::InvalidParameter);
+    };
+    if num_surfaces != 1 {
+        // Chromium/PipeWire one-descriptor-per-surface in practice. Batch
+        // imports in one descriptor are not wired up in this cut.
+        crate::logging::info(
+            ctx,
+            "create_surfaces2: DRM_PRIME_2 with num_surfaces != 1 not supported",
+        );
+        return Err(DriverError::AllocFailed);
+    }
+    // SAFETY: caller asserts the pointer is valid for the duration of
+    // this call; bindgen struct is POD-layout.
+    let desc: &va::VADRMPRIMESurfaceDescriptor = unsafe { &*desc_ptr };
+
+    let image = match crate::cuda::external_mem::ExternalDmaBufImage::import(
+        &state.cuda, desc,
+    ) {
+        Ok(img) => img,
+        Err(e) => {
+            crate::logging::error(
+                ctx,
+                "create_surfaces2: cuImportExternalMemory failed, Chromium will fall back",
+            );
+            // Normalise anything beyond the two retriable errors into
+            // AllocFailed so the client treats it uniformly.
+            return Err(match e {
+                DriverError::InvalidParameter
+                | DriverError::UnsupportedRtFormat
+                | DriverError::UnsupportedMemory => e,
+                _ => DriverError::AllocFailed,
+            });
+        }
+    };
+
+    let mut pools = state.pools.lock();
+    let k: SurfaceKey = pools.surfaces.insert(SurfaceRec {
+        width: image.width,
+        height: image.height,
+        format,
+        kind: SurfaceKind::ExternalDmaBuf {
+            image: Box::new(image),
+            registered_nvenc: std::sync::OnceLock::new(),
+        },
+        registered: Mutex::new(None),
+        cuda_ctx: None,
+    });
+    // SAFETY: caller provided a writable slot.
+    unsafe { *surfaces = key_to_id(k) as va::VASurfaceID };
+    Ok(())
+}
+
 pub unsafe extern "C" fn destroy_surfaces(
     ctx: va::VADriverContextP,
     surface_list: *mut va::VASurfaceID,
@@ -174,6 +281,19 @@ pub unsafe extern "C" fn destroy_surfaces(
         };
         for id in ids {
             if let Some(k) = pools.surfaces.find_by_low_bits(*id as u32) {
+                // For DMA-BUF-backed surfaces we must unregister from
+                // NVENC first — otherwise the session still holds a
+                // registered_ptr pointing at a CUarray whose backing
+                // store is about to disappear.
+                if let Some(rec) = pools.surfaces.get(k) {
+                    if matches!(rec.kind, SurfaceKind::ExternalDmaBuf { .. }) {
+                        for (_, cctx) in pools.contexts.iter() {
+                            if let Some(sess) = cctx.session.lock().as_mut() {
+                                sess.unregister_surface(k);
+                            }
+                        }
+                    }
+                }
                 pools.surfaces.remove(k);
             }
         }
@@ -197,14 +317,22 @@ pub unsafe extern "C" fn query_surface_status(
     })
 }
 
+/// DRM modifier sentinel meaning "any layout is acceptable". Defined by
+/// `drm_fourcc.h` as `DRM_FORMAT_MOD_INVALID = ((1ULL << 56) - 1)`; we
+/// inline it here because va-sys does not re-export DRM headers.
+const DRM_FORMAT_MOD_INVALID: u64 = (1u64 << 56) - 1;
+
 /// Build the fixed list of surface attributes supported by this driver.
 ///
-/// NVENC H.264 on RTX 40-series caps out at 4096×4096 inputs; we also advertise
-/// NV12 as the only pixel format (single-plane register path in c.2) and the VA
-/// internal memory type (raw DMA-BUF import — `DRM_PRIME_2` — is deferred to a
-/// later slice and deliberately *not* advertised here so that Chromium does not
-/// try to hand us external buffers it knows we cannot consume).
-fn supported_attribs() -> [va::VASurfaceAttrib; 6] {
+/// NVENC H.264 on RTX 40-series caps out at 4096×4096 inputs; we advertise
+/// NV12 as the only pixel format. `VASurfaceAttribMemoryType` now carries
+/// both `VA` and `DRM_PRIME_2` bits (slice d) so Chromium/Vesktop use the
+/// zero-copy DMA-BUF path for Wayland/PipeWire screen share. We also
+/// advertise `VASurfaceAttribDRMFormatModifiers = DRM_FORMAT_MOD_INVALID`
+/// which means "accept any layout" — the safest value until we exercise
+/// the import path against real PipeWire output and can list the concrete
+/// modifiers Nouveau/NVIDIA produce.
+fn supported_attribs() -> [va::VASurfaceAttrib; 7] {
     fn int_attr(ty: va::VASurfaceAttribType, flags: u32, v: i32) -> va::VASurfaceAttrib {
         // SAFETY: `VAGenericValue` contains a bindgen-generated union of
         // `i/f/p/fn_` variants — all POD-safe. Zero-initialising the union and
@@ -250,8 +378,21 @@ fn supported_attribs() -> [va::VASurfaceAttrib; 6] {
         int_attr(
             va::VASurfaceAttribMemoryType,
             va::VA_SURFACE_ATTRIB_GETTABLE | va::VA_SURFACE_ATTRIB_SETTABLE,
-            va::VA_SURFACE_ATTRIB_MEM_TYPE_VA as i32,
+            (va::VA_SURFACE_ATTRIB_MEM_TYPE_VA
+                | va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) as i32,
         ),
+        // DRMFormatModifiers: DRM_FORMAT_MOD_INVALID => accept any.
+        // The 64-bit value fits into `bindgen_union_field` directly.
+        {
+            let mut value: va::VAGenericValue = unsafe { core::mem::zeroed() };
+            value.type_ = va::VAGenericValueTypeInteger;
+            value.value.bindgen_union_field = DRM_FORMAT_MOD_INVALID;
+            va::VASurfaceAttrib {
+                type_: va::VASurfaceAttribDRMFormatModifiers,
+                flags: va::VA_SURFACE_ATTRIB_GETTABLE,
+                value,
+            }
+        },
     ]
 }
 
@@ -289,4 +430,100 @@ pub unsafe extern "C" fn query_surface_attributes(
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_mem_type_attr(bits: u32) -> va::VASurfaceAttrib {
+        // SAFETY: POD union zero-init, then write `i` variant.
+        let mut value: va::VAGenericValue = unsafe { core::mem::zeroed() };
+        value.type_ = va::VAGenericValueTypeInteger;
+        value.value.bindgen_union_field = bits as u64;
+        va::VASurfaceAttrib {
+            type_: va::VASurfaceAttribMemoryType,
+            flags: va::VA_SURFACE_ATTRIB_SETTABLE,
+            value,
+        }
+    }
+
+    fn mk_ext_buf_attr(p: *mut core::ffi::c_void) -> va::VASurfaceAttrib {
+        // SAFETY: POD union zero-init, then write `p` pointer variant.
+        let mut value: va::VAGenericValue = unsafe { core::mem::zeroed() };
+        value.type_ = va::VAGenericValueTypePointer;
+        value.value.bindgen_union_field = p as usize as u64;
+        va::VASurfaceAttrib {
+            type_: va::VASurfaceAttribExternalBufferDescriptor,
+            flags: va::VA_SURFACE_ATTRIB_SETTABLE,
+            value,
+        }
+    }
+
+    #[test]
+    fn parse_detects_drm_prime_2_bit() {
+        let attribs = [mk_mem_type_attr(va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)];
+        let (want, desc) = parse_drm_prime_attribs(&attribs);
+        assert!(want);
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn parse_ignores_va_only_memtype() {
+        let attribs = [mk_mem_type_attr(va::VA_SURFACE_ATTRIB_MEM_TYPE_VA)];
+        let (want, _) = parse_drm_prime_attribs(&attribs);
+        assert!(!want);
+    }
+
+    #[test]
+    fn parse_extracts_external_buffer_descriptor_pointer() {
+        // Allocate a zero-filled VADRMPRIMESurfaceDescriptor on the heap
+        // (Box) so the pointer is stable for the duration of the test.
+        let desc = Box::new(unsafe {
+            core::mem::zeroed::<va::VADRMPRIMESurfaceDescriptor>()
+        });
+        let raw = Box::into_raw(desc);
+        let attribs = [
+            mk_mem_type_attr(va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2),
+            mk_ext_buf_attr(raw as *mut core::ffi::c_void),
+        ];
+        let (want, parsed) = parse_drm_prime_attribs(&attribs);
+        assert!(want);
+        assert_eq!(parsed, Some(raw as *const va::VADRMPRIMESurfaceDescriptor));
+        // SAFETY: reclaim and drop the Box we leaked via into_raw.
+        let _ = unsafe { Box::from_raw(raw) };
+    }
+
+    #[test]
+    fn parse_empty_attribs_returns_false() {
+        let (want, desc) = parse_drm_prime_attribs(&[]);
+        assert!(!want);
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn supported_attribs_advertises_drm_prime_2_and_modifiers() {
+        let attribs = supported_attribs();
+        let mem_type = attribs
+            .iter()
+            .find(|a| a.type_ == va::VASurfaceAttribMemoryType)
+            .expect("MemoryType advertised");
+        let bits = unsafe { mem_type.value.value.bindgen_union_field } as u32;
+        assert_eq!(
+            bits & va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            "DRM_PRIME_2 bit missing"
+        );
+        assert_eq!(
+            bits & va::VA_SURFACE_ATTRIB_MEM_TYPE_VA,
+            va::VA_SURFACE_ATTRIB_MEM_TYPE_VA,
+            "VA bit missing"
+        );
+        let modifiers = attribs
+            .iter()
+            .find(|a| a.type_ == va::VASurfaceAttribDRMFormatModifiers)
+            .expect("DRMFormatModifiers advertised");
+        let mod_val = unsafe { modifiers.value.value.bindgen_union_field };
+        assert_eq!(mod_val, DRM_FORMAT_MOD_INVALID);
+    }
 }

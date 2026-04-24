@@ -58,6 +58,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `end_picture` now lazily calls `register_internal_surface` on the
   current render target if it was not listed at `vaCreateContext` time,
   so ffmpeg-style late-bound render targets encode without workarounds.
+- DMA-BUF zero-copy surface import via `cuImportExternalMemory` +
+  `cuExternalMemoryGetMappedMipmappedArray`. Advertises DRM_PRIME_2 in
+  `VASurfaceAttribMemoryType` and `DRM_FORMAT_MOD_INVALID` in
+  `VASurfaceAttribDRMFormatModifiers` so Chromium/Vesktop stop falling
+  back to software OpenH264 for Wayland/PipeWire screen share. NVENC
+  registration uses `NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY` and is done
+  lazily at first `vaEndPicture`. Currently single-object NV12 only;
+  multi-object layouts and BGRA via CUDA colour conversion deferred.
 
 ### Not Yet Implemented
 
@@ -65,8 +73,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `NvEncLockBitstream`).
 - H.264 parameter buffer parsing (`VAEncSequenceParameterBufferH264` →
   `NV_ENC_CONFIG_H264`).
-- DMA-BUF zero-copy surface import (`VASurfaceAttribExternalBuffers` +
-  `cuImportExternalMemory`).
 - `vaExportSurfaceHandle` (post-MVP).
 - `VAProfileH264High`.
 

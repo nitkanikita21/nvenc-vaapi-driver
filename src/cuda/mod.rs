@@ -13,6 +13,8 @@
 
 #![allow(dead_code)]
 
+pub mod external_mem;
+
 use crate::error::DriverError;
 use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};

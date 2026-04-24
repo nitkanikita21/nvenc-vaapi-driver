@@ -159,13 +159,41 @@ pub unsafe extern "C" fn end_picture(
         // passes them at vaBeginPicture rather than listing them up-front in
         // vaCreateContext's render_targets argument.
         if let Some(srec) = pools.surfaces.get(target_key) {
-            if let SurfaceKind::Internal { cu_ptr, pitch, width, height } = srec.kind {
-                if let Err(e) = session.register_internal_surface(
-                    target_key, cu_ptr, pitch, width, height,
-                ) {
-                    crate::logging::error(ctx, "end_picture: register_internal_surface failed");
-                    return Err(e);
+            match &srec.kind {
+                SurfaceKind::Internal { cu_ptr, pitch, width, height } => {
+                    if let Err(e) = session.register_internal_surface(
+                        target_key, *cu_ptr, *pitch, *width, *height,
+                    ) {
+                        crate::logging::error(ctx, "end_picture: register_internal_surface failed");
+                        return Err(e);
+                    }
                 }
+                SurfaceKind::ExternalDmaBuf { image, registered_nvenc } => {
+                    // First encode against this surface: register the
+                    // imported CUarray with NVENC and cache the pointer.
+                    // Subsequent calls short-circuit inside
+                    // register_external_surface itself.
+                    if registered_nvenc.get().is_none() {
+                        match session.register_external_surface(
+                            target_key,
+                            image.plane0,
+                            image.width,
+                            image.height,
+                        ) {
+                            Ok(ptr) => {
+                                let _ = registered_nvenc.set(ptr as usize);
+                            }
+                            Err(e) => {
+                                crate::logging::error(
+                                    ctx,
+                                    "end_picture: register_external_surface failed",
+                                );
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 

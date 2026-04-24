@@ -43,6 +43,19 @@ pub enum SurfaceKind {
     /// `cu_ptr` зберігається як `u64` (CUdeviceptr), щоб не тягнути cudarc-типи
     /// у цей модуль.
     Internal { cu_ptr: u64, pitch: u32, width: u32, height: u32 },
+    /// DMA-BUF zero-copy import. The `ExternalDmaBufImage` owns the CUDA
+    /// external memory + mipmapped array + dup'd fd; registration with
+    /// NVENC is deferred to the first `vaEndPicture` call that targets
+    /// this surface (cached via `registered_nvenc`).
+    ///
+    /// `registered_nvenc` is tracked separately from `SurfaceRec::registered`
+    /// so the Drop path knows to unregister from NVENC (via the session in
+    /// the owning context) BEFORE destroying the CUDA mipmap — violating
+    /// that order crashes the NVIDIA driver.
+    ExternalDmaBuf {
+        image: Box<crate::cuda::external_mem::ExternalDmaBufImage>,
+        registered_nvenc: std::sync::OnceLock<usize>,
+    },
     /// Imported DMA-BUF (dup'd fd kept alive here).
     DmaBuf { fd: libc::c_int },
     /// Placeholder until the backend is wired up.
@@ -72,6 +85,15 @@ impl Drop for SurfaceRec {
                         );
                     }
                 }
+            }
+            SurfaceKind::ExternalDmaBuf { .. } => {
+                // NVENC unregister has to happen before the `image` Box is
+                // dropped (which destroys the mipmap + ext_mem). That
+                // sequencing is handled in `destroy_surfaces` — by the
+                // time we land here either the session has unregistered,
+                // or the session itself was already torn down and took
+                // its registration table with it. Either way, dropping
+                // the `image` Box is safe.
             }
             SurfaceKind::CudaDevice { .. } | SurfaceKind::Stub => {}
         }
