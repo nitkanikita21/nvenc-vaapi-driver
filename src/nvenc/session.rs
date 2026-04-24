@@ -585,7 +585,19 @@ impl NvencSession {
 
     /// Best-effort runtime reconfiguration. On failure we keep the old config
     /// — a full drop-and-recreate is left for a later slice.
-    pub fn reconfigure(&mut self, new_cfg: EncoderConfig) -> Result<(), DriverError> {
+    ///
+    /// `force_idr` controls whether the next frame is forced to an IDR.
+    /// Pass `true` on changes that require decoder resync (profile change,
+    /// resolution change, SPS-driven reconfigure). Pass `false` for pure
+    /// bitrate/framerate updates — Chromium's WebRTC RateController emits
+    /// these on every frame, and forcing IDR every time produces an
+    /// all-keyframe stream which WebRTC interprets as a malfunctioning
+    /// encoder and cycles out of its trial window.
+    pub fn reconfigure(
+        &mut self,
+        new_cfg: EncoderConfig,
+        force_idr: bool,
+    ) -> Result<(), DriverError> {
         if new_cfg == self.config {
             return Ok(());
         }
@@ -631,8 +643,9 @@ impl NvencSession {
         };
         recfg.version = nv::NV_ENC_RECONFIGURE_PARAMS_VER;
         recfg.reInitEncodeParams = reinit;
-        // Force IDR on config change so downstream decoders resync cleanly.
-        recfg.set_forceIDR(1);
+        if force_idr {
+            recfg.set_forceIDR(1);
+        }
         // SAFETY: encoder valid; recfg self-contained except reInitEncodeParams
         // which references preset_cfg, which outlives this call.
         let status = unsafe { (api.reconfigure_encoder)(self.encoder, &mut recfg) };

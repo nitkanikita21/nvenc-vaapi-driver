@@ -231,9 +231,12 @@ pub unsafe extern "C" fn end_picture(
                 new_cfg.fps_den = den.max(1);
             }
             if new_cfg != *session.config() {
-                // forceIDR is already set inside `reconfigure`, so the new
-                // bitrate takes effect on the very next encoded frame.
-                let _ = session.reconfigure(new_cfg);
+                // No forced IDR: WebRTC's RateController sends updated
+                // bitrate targets on every frame; forcing IDR on each one
+                // produces an all-keyframe stream which WebRTC flags as a
+                // malfunctioning encoder and cycles out after ~4 trial
+                // frames. Bitrate/framerate updates take effect mid-GOP.
+                let _ = session.reconfigure(new_cfg, false);
             }
         }
 
@@ -243,8 +246,9 @@ pub unsafe extern "C" fn end_picture(
                     .unwrap_or(H264Profile::Main);
                 let new_cfg = build_cfg_from_sps(&sps_view, profile, session.config());
                 if new_cfg != *session.config() {
-                    // Best-effort; failure is logged and we carry on with old config.
-                    if session.reconfigure(new_cfg).is_err() {
+                    // SPS-driven changes (profile/dimensions/level) need a
+                    // decoder resync — force IDR on the next frame.
+                    if session.reconfigure(new_cfg, true).is_err() {
                         crate::logging::info(
                             ctx,
                             "end_picture: NvEncReconfigureEncoder failed; keeping previous config",
