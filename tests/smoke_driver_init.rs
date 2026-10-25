@@ -19,8 +19,7 @@ use std::ptr;
 use libloading::{Library, Symbol};
 use va_sys as va;
 
-type VaDriverInit =
-    unsafe extern "C" fn(ctx: *mut va::VADriverContext) -> va::VAStatus;
+type VaDriverInit = unsafe extern "C" fn(ctx: *mut va::VADriverContext) -> va::VAStatus;
 
 // libva's `struct drm_state` starts with `int fd`; the rest is irrelevant
 // for our CudaCtx stub (it just reads the first int and dups it).
@@ -63,7 +62,12 @@ impl DriverFixture {
         // Most VADriverContext pointer fields are optional; zeroing is fine.
         let ctx: Box<va::VADriverContext> =
             Box::new(unsafe { MaybeUninit::zeroed().assume_init() });
-        let mut f = DriverFixture { lib, ctx, vtable, _drm: drm };
+        let mut f = DriverFixture {
+            lib,
+            ctx,
+            vtable,
+            _drm: drm,
+        };
         f.ctx.vtable = f.vtable.as_mut() as *mut va::VADriverVTable;
         f.ctx.drm_state = f._drm.as_mut() as *mut _ as *mut c_void;
         f.ctx.info_callback = Some(info_cb);
@@ -113,7 +117,10 @@ unsafe extern "C" fn error_cb(_ctx: *mut va::VADriverContext, msg: *const c_char
 fn driver_init_returns_success_and_populates_vtable() {
     let mut f = DriverFixture::new();
     let status = f.init();
-    assert_eq!(status, 0, "__vaDriverInit_1_23 should return VA_STATUS_SUCCESS");
+    assert_eq!(
+        status, 0,
+        "__vaDriverInit_1_23 should return VA_STATUS_SUCCESS"
+    );
 
     // After init, pDriverData must be non-null (DriverState box was installed).
     assert!(
@@ -147,7 +154,10 @@ fn driver_init_returns_success_and_populates_vtable() {
         "vaQueryConfigEntrypoints missing"
     );
     assert!(f.vtable.vaCreateConfig.is_some(), "vaCreateConfig missing");
-    assert!(f.vtable.vaDestroyConfig.is_some(), "vaDestroyConfig missing");
+    assert!(
+        f.vtable.vaDestroyConfig.is_some(),
+        "vaDestroyConfig missing"
+    );
     assert!(
         f.vtable.vaGetConfigAttributes.is_some(),
         "vaGetConfigAttributes missing"
@@ -169,9 +179,7 @@ fn query_config_profiles_returns_h264_baseline_and_main() {
         .vtable
         .vaQueryConfigProfiles
         .expect("vaQueryConfigProfiles not installed");
-    let status = unsafe {
-        fn_ptr(f.ctx.as_mut() as *mut _, profiles.as_mut_ptr(), &mut n)
-    };
+    let status = unsafe { fn_ptr(f.ctx.as_mut() as *mut _, profiles.as_mut_ptr(), &mut n) };
     assert_eq!(status, 0, "vaQueryConfigProfiles must succeed");
     assert_eq!(n, 3, "driver advertises three H.264 profiles");
     let set: Vec<va::VAProfile> = profiles[..n as usize].to_vec();
@@ -226,10 +234,11 @@ fn query_entrypoints_for_unsupported_profile_fails_cleanly() {
     let fn_ptr = f.vtable.vaQueryConfigEntrypoints.unwrap();
     // VAProfileNone / unrelated profile value.
     let bogus: va::VAProfile = 9999;
-    let status = unsafe {
-        fn_ptr(f.ctx.as_mut() as *mut _, bogus, eps.as_mut_ptr(), &mut n)
-    };
-    assert_ne!(status, 0, "unsupported profile must produce an error status");
+    let status = unsafe { fn_ptr(f.ctx.as_mut() as *mut _, bogus, eps.as_mut_ptr(), &mut n) };
+    assert_ne!(
+        status, 0,
+        "unsupported profile must produce an error status"
+    );
     // Don't assert the exact code — the driver is free to map it to
     // UNSUPPORTED_PROFILE or INVALID_PARAMETER; we just want a non-success
     // with no crash.
@@ -332,5 +341,164 @@ fn all_fallback_init_symbols_are_exported() {
         let name = format!("__vaDriverInit_1_{minor}\0");
         let _sym: Symbol<VaDriverInit> = unsafe { lib.get(name.as_bytes()) }
             .unwrap_or_else(|e| panic!("symbol {} missing: {e}", &name[..name.len() - 1]));
+    }
+}
+
+#[test]
+fn buffer_mapping_rejects_unbalanced_calls_and_invalid_sync() {
+    let mut f = DriverFixture::new();
+    assert_eq!(f.init(), 0);
+    let ctx = &mut *f.ctx as *mut va::VADriverContext;
+    let mut id = va::VA_INVALID_ID;
+    let mut value = 123u32;
+    unsafe {
+        assert_eq!(
+            f.vtable.vaCreateBuffer.unwrap()(
+                ctx,
+                0,
+                va::VAEncMiscParameterBufferType,
+                4,
+                1,
+                (&mut value as *mut u32).cast(),
+                &mut id
+            ),
+            0
+        );
+        assert_ne!(f.vtable.vaUnmapBuffer.unwrap()(ctx, id), 0);
+        let mut ptr = ptr::null_mut();
+        assert_eq!(f.vtable.vaMapBuffer.unwrap()(ctx, id, &mut ptr), 0);
+        assert_eq!(*ptr.cast::<u32>(), 123);
+        assert_ne!(f.vtable.vaMapBuffer.unwrap()(ctx, id, &mut ptr), 0);
+        assert_ne!(f.vtable.vaDestroyBuffer.unwrap()(ctx, id), 0);
+        assert_eq!(f.vtable.vaUnmapBuffer.unwrap()(ctx, id), 0);
+        assert_ne!(f.vtable.vaUnmapBuffer.unwrap()(ctx, id), 0);
+        assert_eq!(f.vtable.vaDestroyBuffer.unwrap()(ctx, id), 0);
+        assert_ne!(f.vtable.vaSyncBuffer.unwrap()(ctx, id, u64::MAX), 0);
+        assert_ne!(
+            f.vtable.vaSyncSurface.unwrap()(ctx, va::VA_INVALID_SURFACE),
+            0
+        );
+    }
+}
+
+#[test]
+fn init_rejects_missing_vtable_without_allocating_state() {
+    let mut f = DriverFixture::new();
+    f.ctx.vtable = ptr::null_mut();
+    assert_ne!(f.init(), 0);
+    assert!(f.ctx.pDriverData.is_null());
+}
+
+#[test]
+fn config_rejects_unsupported_rate_control() {
+    let mut f = DriverFixture::new();
+    assert_eq!(f.init(), 0);
+    let mut attrib = va::VAConfigAttrib {
+        type_: va::VAConfigAttribRateControl,
+        value: u32::MAX,
+    };
+    let mut id = va::VA_INVALID_ID;
+    assert_ne!(
+        unsafe {
+            f.vtable.vaCreateConfig.unwrap()(
+                &mut *f.ctx,
+                va::VAProfileH264Main,
+                va::VAEntrypointEncSlice,
+                &mut attrib,
+                1,
+                &mut id,
+            )
+        },
+        0
+    );
+    assert_eq!(id, va::VA_INVALID_ID);
+}
+
+#[test]
+fn buffer_element_count_can_shrink_and_expand_within_its_allocation() {
+    let mut f = DriverFixture::new();
+    assert_eq!(f.init(), 0);
+    let ctx = &mut *f.ctx as *mut va::VADriverContext;
+    let mut id = va::VA_INVALID_ID;
+    unsafe {
+        assert_eq!(
+            f.vtable.vaCreateBuffer.unwrap()(
+                ctx,
+                0,
+                va::VAEncSliceParameterBufferType,
+                4,
+                4,
+                ptr::null_mut(),
+                &mut id
+            ),
+            0
+        );
+        for count in [1, 4, 0, 2] {
+            assert_eq!(f.vtable.vaBufferSetNumElements.unwrap()(ctx, id, count), 0);
+            let mut actual = 999;
+            assert_eq!(
+                f.vtable.vaBufferInfo.unwrap()(
+                    ctx,
+                    id,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut actual
+                ),
+                0
+            );
+            assert_eq!(actual, count);
+        }
+        assert_ne!(f.vtable.vaBufferSetNumElements.unwrap()(ctx, id, 5), 0);
+    }
+}
+
+#[test]
+fn capabilities_reject_packed_header_passthrough_and_malformed_config_arrays() {
+    let mut f = DriverFixture::new();
+    assert_eq!(f.init(), 0);
+    let mut attrib = va::VAConfigAttrib {
+        type_: va::VAConfigAttribEncPackedHeaders,
+        value: u32::MAX,
+    };
+    let ctx = &mut *f.ctx;
+    unsafe {
+        assert_eq!(
+            f.vtable.vaGetConfigAttributes.unwrap()(
+                ctx,
+                va::VAProfileH264Main,
+                va::VAEntrypointEncSlice,
+                &mut attrib,
+                1
+            ),
+            0
+        );
+        assert_eq!(attrib.value, 0, "NVENC generates its own headers");
+        attrib.value = va::VA_ENC_PACKED_HEADER_SLICE;
+        let mut id = va::VA_INVALID_ID;
+        assert_ne!(
+            f.vtable.vaCreateConfig.unwrap()(
+                ctx,
+                va::VAProfileH264Main,
+                va::VAEntrypointEncSlice,
+                &mut attrib,
+                1,
+                &mut id
+            ),
+            0
+        );
+        for count in [-1, 1] {
+            assert_eq!(
+                f.vtable.vaCreateConfig.unwrap()(
+                    ctx,
+                    va::VAProfileH264Main,
+                    va::VAEntrypointEncSlice,
+                    ptr::null_mut(),
+                    count,
+                    &mut id
+                ),
+                va::VA_STATUS_ERROR_INVALID_PARAMETER as i32
+            );
+        }
+        assert_eq!(id, va::VA_INVALID_ID);
     }
 }

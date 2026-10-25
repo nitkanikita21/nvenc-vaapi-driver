@@ -1,14 +1,15 @@
 //! Root driver state, owned by `VADriverContext::pDriverData` via `Box`.
 
 use crate::cuda::CudaCtx;
+use crate::ids::IdPool;
 use crate::nvenc::NvencSession;
 use parking_lot::Mutex;
-use slotmap::DenseSlotMap;
 use va_sys as va;
 
 use crate::ids::{BufferKey, ConfigKey, ContextKey, ImageKey, SurfaceKey};
 
 // Configuration record (one per vaCreateConfig).
+#[derive(Clone, Copy)]
 pub struct ConfigRec {
     pub profile: va::VAProfile,
     pub entrypoint: va::VAEntrypoint,
@@ -42,19 +43,16 @@ pub enum SurfaceKind {
     ///
     /// `cu_ptr` зберігається як `u64` (CUdeviceptr), щоб не тягнути cudarc-типи
     /// у цей модуль.
-    Internal { cu_ptr: u64, pitch: u32, width: u32, height: u32 },
-    /// DMA-BUF zero-copy import. The `ExternalDmaBufImage` owns the CUDA
-    /// external memory + mipmapped array + dup'd fd; registration with
-    /// NVENC is deferred to the first `vaEndPicture` call that targets
-    /// this surface (cached via `registered_nvenc`).
-    ///
-    /// `registered_nvenc` is tracked separately from `SurfaceRec::registered`
-    /// so the Drop path knows to unregister from NVENC (via the session in
-    /// the owning context) BEFORE destroying the CUDA mipmap — violating
-    /// that order crashes the NVIDIA driver.
+    Internal {
+        cu_ptr: u64,
+        pitch: u32,
+        width: u32,
+        height: u32,
+    },
+    /// Imported CUDA memory. Each NVENC session caches its own registration;
+    /// all sessions must unregister before this image can be destroyed.
     ExternalDmaBuf {
         image: Box<crate::cuda::external_mem::ExternalDmaBufImage>,
-        registered_nvenc: std::sync::OnceLock<usize>,
     },
     /// Imported DMA-BUF (dup'd fd kept alive here).
     DmaBuf { fd: libc::c_int },
@@ -101,7 +99,7 @@ impl Drop for SurfaceRec {
 }
 
 pub struct ContextRec {
-    pub config: ConfigKey,
+    pub config: ConfigRec,
     pub width: u32,
     pub height: u32,
     pub flag: i32,
@@ -181,39 +179,12 @@ pub struct PendingFrame {
     /// arrives on the next render_picture call.
     pub pending_packed_kind: Option<PackedHeaderKind>,
     pub coded_buf: Option<BufferKey>,
-    /// Dynamic bitrate target (bps) received via
-    /// `VAEncMiscParameterTypeRateControl` during render_picture.
-    /// Consumed in end_picture to reconfigure the NVENC session.
-    /// Critical for WebRTC: Chromium's RateController sends this on
-    /// every frame and penalises encoders that ignore it.
-    pub misc_bitrate_bps: Option<u32>,
+    pub misc_rate_control: Option<crate::h264::RateControlParams>,
+    /// Explicit HRD size and initial fullness in bits.
+    pub misc_hrd: Option<(u32, u32)>,
     /// Dynamic target framerate, `fps_num / fps_den`, from
     /// `VAEncMiscParameterTypeFrameRate`.
     pub misc_fps: Option<(u32, u32)>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::PackedHeaderKind;
-
-    #[test]
-    fn packed_kind_maps_all_h264_variants() {
-        assert_eq!(PackedHeaderKind::from_va_type(1), Some(PackedHeaderKind::Sequence));
-        assert_eq!(PackedHeaderKind::from_va_type(2), Some(PackedHeaderKind::Picture));
-        assert_eq!(PackedHeaderKind::from_va_type(3), Some(PackedHeaderKind::Slice));
-        assert_eq!(PackedHeaderKind::from_va_type(4), Some(PackedHeaderKind::RawData));
-    }
-
-    #[test]
-    fn packed_kind_rejects_misc_and_unknown() {
-        // Misc mask: any type with 0x80000000 set.
-        assert_eq!(PackedHeaderKind::from_va_type(0x8000_0001), None);
-        assert_eq!(PackedHeaderKind::from_va_type(0xFFFF_FFFF), None);
-        // Unknown low-bits values.
-        assert_eq!(PackedHeaderKind::from_va_type(0), None);
-        assert_eq!(PackedHeaderKind::from_va_type(5), None);
-        assert_eq!(PackedHeaderKind::from_va_type(999), None);
-    }
 }
 
 /// Coded-bitstream output slot.
@@ -254,17 +225,22 @@ pub struct BufferRec {
     pub buf_type: va::VABufferType,
     pub element_size: u32,
     pub num_elements: u32,
+    pub allocated_elements: u32,
     pub storage: BufferStorage,
     /// Coded-segment header scratch; for EncCodedBufferType we hand back a
     /// VACodedBufferSegment chain written at the head of `storage`.
     pub coded_ready: Mutex<bool>,
+    /// The exact submitted picture awaiting publication into this buffer.
+    pub pending_output: Mutex<Option<std::sync::Arc<crate::nvenc::output::EncodedFrame>>>,
+    /// Active map access flags; None means unmapped.
+    pub mapped: Mutex<Option<u32>>,
 }
 
 /// VA image record. Either a standalone `vaCreateImage` allocation
 /// (`surface_key = None`) or a derived image bound to a specific surface
 /// (`surface_key = Some`). In both cases the pixel bytes live in a generic
-/// buffer slot referenced by `buffer_key`; on `vaUnmapBuffer` of a derived
-/// image we trigger a host→device `cuMemcpy2D_v2` into the owning surface.
+/// buffer slot referenced by `buffer_key`. Read maps refresh a derived image
+/// from its surface; writable unmaps upload the host bytes to that surface.
 pub struct ImageRec {
     pub surface_key: Option<SurfaceKey>,
     pub fourcc: u32,
@@ -277,21 +253,24 @@ pub struct ImageRec {
 }
 
 pub struct Pools {
-    pub configs: DenseSlotMap<ConfigKey, ConfigRec>,
-    pub surfaces: DenseSlotMap<SurfaceKey, SurfaceRec>,
-    pub contexts: DenseSlotMap<ContextKey, ContextRec>,
-    pub buffers: DenseSlotMap<BufferKey, BufferRec>,
-    pub images: DenseSlotMap<ImageKey, ImageRec>,
+    pub configs: IdPool<ConfigKey, ConfigRec>,
+    pub surfaces: IdPool<SurfaceKey, SurfaceRec>,
+    pub contexts: IdPool<ContextKey, ContextRec>,
+    pub buffers: IdPool<BufferKey, BufferRec>,
+    pub images: IdPool<ImageKey, ImageRec>,
+    /// One bounded, unmapped host allocation for subsequent image creation.
+    pub image_bytes_cache: Vec<u8>,
 }
 
 impl Pools {
     fn new() -> Self {
         Self {
-            configs: DenseSlotMap::with_key(),
-            surfaces: DenseSlotMap::with_key(),
-            contexts: DenseSlotMap::with_key(),
-            buffers: DenseSlotMap::with_key(),
-            images: DenseSlotMap::with_key(),
+            configs: IdPool::with_key(),
+            surfaces: IdPool::with_key(),
+            contexts: IdPool::with_key(),
+            buffers: IdPool::with_key(),
+            images: IdPool::with_key(),
+            image_bytes_cache: Vec::new(),
         }
     }
 }
@@ -307,5 +286,50 @@ impl DriverState {
             cuda: CudaCtx::from_va_context(ctx)?,
             pools: Mutex::new(Pools::new()),
         })
+    }
+}
+
+// Sessions hold registrations into surface memory. Rust's field order would
+// otherwise drop surfaces before contexts on vaTerminate.
+impl Drop for Pools {
+    fn drop(&mut self) {
+        self.contexts.clear();
+        self.surfaces.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PackedHeaderKind;
+
+    #[test]
+    fn packed_kind_maps_all_h264_variants() {
+        assert_eq!(
+            PackedHeaderKind::from_va_type(1),
+            Some(PackedHeaderKind::Sequence)
+        );
+        assert_eq!(
+            PackedHeaderKind::from_va_type(2),
+            Some(PackedHeaderKind::Picture)
+        );
+        assert_eq!(
+            PackedHeaderKind::from_va_type(3),
+            Some(PackedHeaderKind::Slice)
+        );
+        assert_eq!(
+            PackedHeaderKind::from_va_type(4),
+            Some(PackedHeaderKind::RawData)
+        );
+    }
+
+    #[test]
+    fn packed_kind_rejects_misc_and_unknown() {
+        // Misc mask: any type with 0x80000000 set.
+        assert_eq!(PackedHeaderKind::from_va_type(0x8000_0001), None);
+        assert_eq!(PackedHeaderKind::from_va_type(0xFFFF_FFFF), None);
+        // Unknown low-bits values.
+        assert_eq!(PackedHeaderKind::from_va_type(0), None);
+        assert_eq!(PackedHeaderKind::from_va_type(5), None);
+        assert_eq!(PackedHeaderKind::from_va_type(999), None);
     }
 }

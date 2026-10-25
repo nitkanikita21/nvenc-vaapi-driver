@@ -31,6 +31,7 @@ pub mod context;
 pub mod buffer;
 pub mod picture;
 pub mod sync;
+pub(crate) mod completion;
 pub mod image;
 pub mod export;
 pub mod display_attr;

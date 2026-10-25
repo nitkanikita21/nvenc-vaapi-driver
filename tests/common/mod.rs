@@ -23,16 +23,13 @@ static DRIVER_PATH: OnceCell<PathBuf> = OnceCell::new();
 pub fn build_driver() -> PathBuf {
     DRIVER_PATH
         .get_or_init(|| {
+            if let Some(path) = std::env::var_os("NVENC_TEST_DRIVER") {
+                return std::fs::canonicalize(path).expect("NVENC_TEST_DRIVER library exists");
+            }
             let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
             let status = Command::new(env!("CARGO"))
-                .args([
-                    "build",
-                    "--release",
-                    "--lib",
-                    "-p",
-                    "libvaapi-rust-nvenc",
-                ])
+                .args(["build", "--release", "--lib", "-p", "libvaapi-rust-nvenc"])
                 .current_dir(&manifest_dir)
                 .status()
                 .expect("failed to spawn `cargo build` for driver");
@@ -70,9 +67,28 @@ pub fn ensure_libva_symlink() -> PathBuf {
         return link;
     }
     // best-effort: create a relative symlink
-    let _ = std::os::unix::fs::symlink(
-        real.file_name().expect("driver file has no name"),
-        &link,
-    );
+    let _ = std::os::unix::fs::symlink(real.file_name().expect("driver file has no name"), &link);
     link
+}
+
+/// Find an NVIDIA render node without assuming DRM enumeration order.
+pub fn render_node() -> PathBuf {
+    if let Some(path) = std::env::var_os("NVENC_TEST_RENDER_NODE") {
+        return path.into();
+    }
+    let mut nodes: Vec<_> = std::fs::read_dir("/sys/class/drm")
+        .expect("DRM sysfs")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("renderD"))
+        .filter(|e| {
+            std::fs::read_to_string(e.path().join("device/vendor"))
+                .is_ok_and(|v| v.trim() == "0x10de")
+        })
+        .map(|e| PathBuf::from("/dev/dri").join(e.file_name()))
+        .collect();
+    nodes.sort();
+    nodes
+        .into_iter()
+        .next()
+        .expect("no NVIDIA render node; set NVENC_TEST_RENDER_NODE")
 }

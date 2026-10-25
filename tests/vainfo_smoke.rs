@@ -23,34 +23,18 @@ fn vainfo_lists_h264_main_encslice() {
     let _link = common::ensure_libva_symlink();
     let drivers_path = common::drivers_path();
 
-    // vainfo may not be present on CI — fail soft.
-    if !has_vainfo() {
-        eprintln!("vainfo not found on PATH; skipping end-to-end smoke");
-        return;
-    }
-
-    Command::new("vainfo")
+    let binary = std::env::var_os("NVENC_TEST_VAINFO").unwrap_or_else(|| "vainfo".into());
+    Command::new(binary)
         .env("LIBVA_DRIVERS_PATH", &drivers_path)
         .env("LIBVA_DRIVER_NAME", "nvidia_nvenc")
         .arg("--display")
         .arg("drm")
         .arg("--device")
-        .arg("/dev/dri/renderD128")
+        .arg(common::render_node())
         .assert()
         .success()
         .stdout(
             predicate::str::contains("VAProfileH264Main")
                 .and(predicate::str::contains("VAEntrypointEncSlice")),
         );
-}
-
-fn has_vainfo() -> bool {
-    let Ok(path) = std::env::var("PATH") else { return false; };
-    for p in path.split(':') {
-        let candidate = std::path::Path::new(p).join("vainfo");
-        if candidate.is_file() {
-            return true;
-        }
-    }
-    false
 }

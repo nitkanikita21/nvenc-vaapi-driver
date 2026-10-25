@@ -1,29 +1,10 @@
 //! DMA-BUF → CUDA external memory import (RAII wrapper).
 //!
-//! The pipeline (see NVIDIA CUDA Programming Guide §5.3 "External Resource
-//! Interoperability" and the CUDA Driver API manual entries for
-//! `cuImportExternalMemory` / `cuExternalMemoryGetMappedMipmappedArray`):
-//!
-//! 1. A caller (e.g. Chromium/Vesktop on Wayland) hands us a
-//!    `VADRMPRIMESurfaceDescriptor` produced by PipeWire. The descriptor
-//!    owns at least one DMA-BUF `fd` plus layer/offset metadata.
-//! 2. We `dup` the fd (so the caller may close their copy immediately) and
-//!    pass it to `cuImportExternalMemory` with
-//!    `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD`. CUDA takes ownership of
-//!    the duplicate from that point on, but we also keep our own copy so
-//!    that `Drop` can close it deterministically after CUDA is done.
-//! 3. We map a single mipmapped array that covers the packed NV12 surface
-//!    (`width × height * 3/2`, 8-bit, 1 channel). NVENC consumes this
-//!    through `NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY` at encode time.
-//! 4. `Drop` tears down mipmap → external memory → dup'd fd, in that exact
-//!    order; reversing it crashes the CUDA driver because the mipmap holds
-//!    a live reference to the external memory.
-//!
-//! Only single-object / single-layer NV12 is supported in this first cut.
-//! Chromium/PipeWire in practice emit exactly that for Wayland screen
-//! share; once we verify the real wire format on live captures, the
-//! multi-object code path can be wired up without touching the rest of
-//! the driver.
+//! Only tightly packed, single-object, linear NV12 can be mapped as the
+//! packed CUDA array used by this backend. Reject other plane layouts and
+//! modifiers rather than silently interpreting tiled/padded pixels as linear.
+//! Successful OPAQUE_FD import transfers the duplicate fd to CUDA. The
+//! retained CUDA context outlives both the mapped array and external memory.
 
 use crate::cuda::CudaCtx;
 use crate::error::DriverError;
@@ -39,7 +20,7 @@ use va_sys as va;
 /// * `plane0` is the level-0 `CUarray` extracted from `mip`. It aliases
 ///   memory owned by `mip` and therefore MUST NOT be destroyed directly;
 ///   it dies with `mip` in `Drop`.
-/// * `dup_fd >= 0` is an fd we own and close in `Drop` AFTER CUDA teardown.
+/// * CUDA owns the imported duplicate fd; only the failed-import path closes it.
 ///
 /// # Thread-safety
 /// Not `Sync`. The raw CUDA handles are thread-safe from CUDA's side, but
@@ -56,7 +37,7 @@ pub struct ExternalDmaBufImage {
     pub width: u32,
     pub height: u32,
     pub fourcc: u32,
-    dup_fd: libc::c_int,
+    cuda_ctx: std::sync::Arc<cudarc::driver::CudaContext>,
 }
 
 // SAFETY: the CUDA runtime serialises all external-memory operations; the
@@ -73,7 +54,7 @@ impl ExternalDmaBufImage {
     ///   because we dup it internally.
     /// * `desc.fourcc` is `VA_FOURCC_NV12` (other formats return
     ///   `DriverError::UnsupportedRtFormat`).
-    /// * `desc.width`/`height` are non-zero.
+    /// * `desc` passes `validate_descriptor`.
     ///
     /// # Postconditions on success
     /// `plane0` points at a level-0 mipmap slice whose lifetime is tied to
@@ -92,26 +73,8 @@ impl ExternalDmaBufImage {
         cuda: &CudaCtx,
         desc: &va::VADRMPRIMESurfaceDescriptor,
     ) -> Result<Self, DriverError> {
-        // 1. Validate descriptor fields before touching CUDA.
-        if desc.num_objects == 0 || desc.num_layers == 0 {
-            return Err(DriverError::InvalidParameter);
-        }
-        if desc.width == 0 || desc.height == 0 {
-            return Err(DriverError::InvalidParameter);
-        }
-        if desc.fourcc != va::VA_FOURCC_NV12 {
-            return Err(DriverError::UnsupportedRtFormat);
-        }
-        // Multi-object NV12 (Y and UV in separate DMA-BUF objects) is not
-        // yet wired up; Chromium/PipeWire emits single-object packed NV12
-        // in the common case.
-        if desc.num_objects != 1 {
-            return Err(DriverError::UnsupportedMemory);
-        }
+        validate_descriptor(desc)?;
         let obj = &desc.objects[0];
-        if obj.fd < 0 || obj.size == 0 {
-            return Err(DriverError::InvalidParameter);
-        }
 
         // 2. Ensure CUDA context exists and is current on this thread.
         let cuda_ctx = cuda.get_or_init()?;
@@ -130,8 +93,7 @@ impl ExternalDmaBufImage {
         // 4. Build the external memory handle descriptor.
         //    SAFETY: the whole struct is POD; bindgen produces a union we
         //    zero-initialise, then overwrite `fd` variant.
-        let mut handle_desc: cu::CUDA_EXTERNAL_MEMORY_HANDLE_DESC =
-            unsafe { core::mem::zeroed() };
+        let mut handle_desc: cu::CUDA_EXTERNAL_MEMORY_HANDLE_DESC = unsafe { core::mem::zeroed() };
         handle_desc.type_ =
             cu::CUexternalMemoryHandleType::CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
         handle_desc.handle.fd = dup_fd;
@@ -171,14 +133,11 @@ impl ExternalDmaBufImage {
         let mut mip: cu::CUmipmappedArray = core::ptr::null_mut();
         // SAFETY: ext_mem is live; mip_desc is fully initialised; mip is a
         // writable local.
-        let r = unsafe {
-            cu::cuExternalMemoryGetMappedMipmappedArray(&mut mip, ext_mem, &mip_desc)
-        };
+        let r =
+            unsafe { cu::cuExternalMemoryGetMappedMipmappedArray(&mut mip, ext_mem, &mip_desc) };
         if r != cu::CUresult::CUDA_SUCCESS || mip.is_null() {
             // SAFETY: ext_mem came from cuImportExternalMemory above.
             unsafe { cu::cuDestroyExternalMemory(ext_mem) };
-            // SAFETY: we own dup_fd.
-            unsafe { libc::close(dup_fd) };
             return Err(DriverError::AllocFailed);
         }
 
@@ -192,8 +151,6 @@ impl ExternalDmaBufImage {
             unsafe { cu::cuMipmappedArrayDestroy(mip) };
             // SAFETY: ext_mem from cuImportExternalMemory.
             unsafe { cu::cuDestroyExternalMemory(ext_mem) };
-            // SAFETY: we own dup_fd.
-            unsafe { libc::close(dup_fd) };
             return Err(DriverError::AllocFailed);
         }
 
@@ -205,13 +162,16 @@ impl ExternalDmaBufImage {
             width: desc.width,
             height: desc.height,
             fourcc: desc.fourcc,
-            dup_fd,
+            cuda_ctx,
         })
     }
 }
 
 impl Drop for ExternalDmaBufImage {
     fn drop(&mut self) {
+        if self.cuda_ctx.bind_to_thread().is_err() {
+            return;
+        }
         // Teardown order is load-bearing: the mipmapped array references
         // the external memory, which references the fd. Reverse destroy.
         // Never panic from Drop — log-only is the caller's concern.
@@ -223,11 +183,9 @@ impl Drop for ExternalDmaBufImage {
         unsafe {
             let _ = cu::cuDestroyExternalMemory(self.ext_mem);
         }
-        if self.dup_fd >= 0 {
-            // SAFETY: we own the dup'd fd and CUDA has released its
-            // reference above.
-            unsafe { libc::close(self.dup_fd) };
-        }
+        // A successful OPAQUE_FD import transfers fd ownership to CUDA.
+        // Closing that numeric descriptor again could close an unrelated fd
+        // that another thread has opened since the import.
     }
 }
 
@@ -236,13 +194,12 @@ impl Drop for ExternalDmaBufImage {
 /// Returns the same `DriverError` a full `import` call would return for
 /// parameter-level validation failures (no CUDA calls). Used by unit tests
 /// to exercise every branch without a GPU.
-pub fn validate_descriptor(
-    desc: &va::VADRMPRIMESurfaceDescriptor,
-) -> Result<(), DriverError> {
-    if desc.num_objects == 0 || desc.num_layers == 0 {
+pub fn validate_descriptor(desc: &va::VADRMPRIMESurfaceDescriptor) -> Result<(), DriverError> {
+    if desc.num_objects == 0 || desc.num_layers == 0 || desc.num_layers as usize > desc.layers.len()
+    {
         return Err(DriverError::InvalidParameter);
     }
-    if desc.width == 0 || desc.height == 0 {
+    if desc.width == 0 || desc.height == 0 || desc.width & 1 != 0 || desc.height & 1 != 0 {
         return Err(DriverError::InvalidParameter);
     }
     if desc.fourcc != va::VA_FOURCC_NV12 {
@@ -255,6 +212,25 @@ pub fn validate_descriptor(
     if obj.fd < 0 || obj.size == 0 {
         return Err(DriverError::InvalidParameter);
     }
+    if desc.num_layers != 1 || obj.drm_format_modifier != 0 {
+        return Err(DriverError::UnsupportedMemory);
+    }
+    let layer = &desc.layers[0];
+    if layer.num_planes != 2
+        || layer.drm_format != va::VA_FOURCC_NV12
+        || layer.object_index[0] != 0
+        || layer.object_index[1] != 0
+        || layer.pitch[0] != desc.width
+        || layer.pitch[1] != desc.width
+    {
+        return Err(DriverError::UnsupportedMemory);
+    }
+    let y_size = u64::from(desc.width) * u64::from(desc.height);
+    let uv_offset = u64::from(layer.offset[0]) + y_size;
+    let end = uv_offset + y_size / 2;
+    if u64::from(layer.offset[1]) != uv_offset || end > u64::from(obj.size) {
+        return Err(DriverError::InvalidParameter);
+    }
     Ok(())
 }
 
@@ -265,8 +241,7 @@ mod tests {
     fn fresh_desc() -> va::VADRMPRIMESurfaceDescriptor {
         // SAFETY: POD layout — all-zero is a valid bit pattern for every
         // field (u32/i32/u64). We mutate required fields below.
-        let mut d: va::VADRMPRIMESurfaceDescriptor =
-            unsafe { core::mem::zeroed() };
+        let mut d: va::VADRMPRIMESurfaceDescriptor = unsafe { core::mem::zeroed() };
         d.fourcc = va::VA_FOURCC_NV12;
         d.width = 1280;
         d.height = 720;
@@ -275,6 +250,11 @@ mod tests {
         d.objects[0].fd = 100; // fake but non-negative
         d.objects[0].size = 1280 * 720 * 3 / 2;
         d.objects[0].drm_format_modifier = 0;
+        d.layers[0].drm_format = va::VA_FOURCC_NV12;
+        d.layers[0].num_planes = 2;
+        d.layers[0].pitch[0] = d.width;
+        d.layers[0].pitch[1] = d.width;
+        d.layers[0].offset[1] = d.width * d.height;
         d
     }
 
@@ -341,6 +321,25 @@ mod tests {
             validate_descriptor(&d),
             Err(DriverError::InvalidParameter)
         ));
+    }
+
+    #[test]
+    fn rejects_tiling_padding_and_out_of_bounds_planes() {
+        let mut d = fresh_desc();
+        d.objects[0].drm_format_modifier = 1;
+        assert!(validate_descriptor(&d).is_err());
+        let mut d = fresh_desc();
+        d.layers[0].pitch[0] += 128;
+        assert!(validate_descriptor(&d).is_err());
+        let mut d = fresh_desc();
+        d.layers[0].offset[1] += 1;
+        assert!(validate_descriptor(&d).is_err());
+        let mut d = fresh_desc();
+        d.objects[0].size -= 1;
+        assert!(validate_descriptor(&d).is_err());
+        let mut d = fresh_desc();
+        d.num_layers = u32::MAX;
+        assert!(validate_descriptor(&d).is_err());
     }
 
     #[test]

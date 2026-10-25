@@ -1,9 +1,8 @@
 //! CUDA Driver API adapter (via `cudarc` with `dynamic-loading`).
 //!
-//! The driver picks a CUDA device based on the PCI bus id resolved from the
-//! libva-provided DRM fd. If anything in that chain fails (no DRM fd, sysfs
-//! read error, `cuDeviceGetByPCIBusId` miss), we fall back to device 0 —
-//! which on single-GPU NVIDIA systems is almost always correct.
+//! Prefer the explicit NVENC_VAAPI_DEVICE PCI address, then match the DRM
+//! device. An unmatched display can use the sole CUDA device; ambiguous
+//! multi-NVIDIA configurations require an explicit choice.
 //!
 //! The full `cudarc::driver::CudaContext` is built lazily. Touching
 //! `libcuda.so.1` (even via `dynamic-loading`) on a machine without the
@@ -38,7 +37,10 @@ impl CudaCtx {
         }
         // SAFETY: ctx non-null per check above.
         let (display_type, drm_state_p) = unsafe {
-            ((*ctx).display_type, (*ctx).drm_state as *const va::drm_state)
+            (
+                (*ctx).display_type,
+                (*ctx).drm_state as *const va::drm_state,
+            )
         };
         // `drm_state` is only a valid `struct drm_state` pointer when libva
         // was opened via `vaGetDisplayDRM`. For X11/Wayland/Android/other
@@ -80,7 +82,7 @@ impl CudaCtx {
         if let Some(c) = self.ctx.get() {
             return Ok(c.clone());
         }
-        let ordinal = self.pick_device_ordinal();
+        let ordinal = self.pick_device_ordinal()?;
         let c = cudarc::driver::CudaContext::new(ordinal)
             .map_err(|_| DriverError::OperationFailed("cuCtxCreate failed"))?;
         let _ = self.ctx.set(c.clone());
@@ -90,22 +92,40 @@ impl CudaCtx {
     /// Resolve a CUDA device ordinal from the DRM fd via sysfs.
     ///
     /// Follows `/sys/dev/char/<major>:<minor>/device` to the PCI bus id
-    /// (`DDDD:BB:DD.F`) and calls `cuDeviceGetByPCIBusId`. Any failure
-    /// falls back to ordinal 0.
-    fn pick_device_ordinal(&self) -> usize {
-        let Some(fd) = self.drm_fd else { return 0 };
+    /// (`DDDD:BB:DD.F`) and calls `cuDeviceGetByPCIBusId`.
+    fn pick_device_ordinal(&self) -> Result<usize, DriverError> {
+        // A PCI address remains stable when DRM/CUDA enumeration changes.
+        if let Some(bus_id) = std::env::var_os("NVENC_VAAPI_DEVICE") {
+            let bus_id = bus_id.to_str().ok_or(DriverError::InvalidParameter)?;
+            return Self::cuda_ordinal_for_pci(bus_id);
+        }
+        if let Some(bus_id) = self.drm_pci_address() {
+            if let Ok(ordinal) = Self::cuda_ordinal_for_pci(&bus_id) {
+                return Ok(ordinal);
+            }
+        }
+        use cudarc::driver::sys::{CUresult, cuDeviceGetCount, cuInit};
+        let mut count = 0;
+        // SAFETY: idempotent initialisation; count is a writable local.
+        if unsafe { cuInit(0) } != CUresult::CUDA_SUCCESS
+            || unsafe { cuDeviceGetCount(&mut count) } != CUresult::CUDA_SUCCESS
+        {
+            return Err(DriverError::OperationFailed("CUDA device enumeration"));
+        }
+        select_single_device(count)
+    }
+
+    fn drm_pci_address(&self) -> Option<String> {
+        let fd = self.drm_fd?;
         // SAFETY: fstat writes into an owned local; fd is open.
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
-            return 0;
+            return None;
         }
         let (major, minor) = (libc::major(st.st_rdev), libc::minor(st.st_rdev));
         let link = format!("/sys/dev/char/{}:{}/device", major, minor);
-        let Ok(resolved) = std::fs::read_link(&link) else { return 0 };
-        let Some(bus_id) = resolved.file_name().and_then(|s| s.to_str()) else {
-            return 0;
-        };
-        Self::cuda_ordinal_for_pci(bus_id).unwrap_or(0)
+        let resolved = std::fs::read_link(&link).ok()?;
+        Some(resolved.file_name()?.to_str()?.to_owned())
     }
 
     fn cuda_ordinal_for_pci(bus_id: &str) -> Result<usize, DriverError> {
@@ -116,8 +136,7 @@ impl CudaCtx {
         if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             return Err(DriverError::OperationFailed("cuInit"));
         }
-        let c = CString::new(bus_id)
-            .map_err(|_| DriverError::OperationFailed("bad pci id"))?;
+        let c = CString::new(bus_id).map_err(|_| DriverError::OperationFailed("bad pci id"))?;
         let mut dev: CUdevice = 0;
         // SAFETY: FFI call, dev is valid for writes.
         let r = unsafe { cuDeviceGetByPCIBusId(&mut dev, c.as_ptr()) };
@@ -128,11 +147,33 @@ impl CudaCtx {
     }
 }
 
+fn select_single_device(count: i32) -> Result<usize, DriverError> {
+    if count == 1 {
+        Ok(0)
+    } else {
+        Err(DriverError::OperationFailed(
+            "no unambiguous NVIDIA device; set NVENC_VAAPI_DEVICE to a PCI address",
+        ))
+    }
+}
+
 impl Drop for CudaCtx {
     fn drop(&mut self) {
         if let Some(fd) = self.drm_fd.take() {
             // SAFETY: we own the dup'd fd.
             unsafe { libc::close(fd) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fallback_requires_exactly_one_cuda_device() {
+        assert_eq!(select_single_device(1).unwrap(), 0);
+        for count in [-1, 0, 2, 8] {
+            assert!(select_single_device(count).is_err());
         }
     }
 }

@@ -7,10 +7,8 @@
 //! GOP, RC-параметри та VUI. Поля, не згадані тут (тюнінг-hint-и, резерв,
 //! matrix-коефіцієнти окрім VUI), лишаються такими, як виставив preset.
 //!
-//! Тести у цьому файлі не викликають жодного FFI — preset-default
-//! емулюється через `MaybeUninit::zeroed()`, що безпечно для POD-структур
-//! NVENC. Реальний FFI-шлях (`nvEncGetEncodePresetConfigEx` → `apply_config`
-//! → `NvEncInitializeEncoder`) буде доданий у наступному slice (c.2).
+//! Tests use a synthetic config with valid Rust enum discriminants. Runtime
+//! sessions obtain preset defaults from NVENC before applying these overrides.
 
 use crate::nvenc::preset;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
@@ -44,9 +42,18 @@ pub struct EncoderConfig {
     pub fps_num: u32,
     pub fps_den: u32,
     pub bitrate_bps: u32,
+    pub max_bitrate_bps: u32,
     pub gop_length: u32,
     pub profile: H264Profile,
     pub rc_mode: preset::RcMode,
+    pub qp: u32,
+    /// Zero leaves the corresponding rate-control hint unspecified.
+    pub initial_qp: u32,
+    pub min_qp: u32,
+    pub max_qp: u32,
+    pub window_size_ms: u32,
+    /// Explicit HRD buffering takes precedence over the rate-control window.
+    pub hrd: Option<HrdBuffer>,
     /// Коли `true`, NVENC сам вставляє SPS+PPS перед кожним IDR
     /// (`repeatSPSPPS=1`). Це історичний default для ffmpeg/gst-клієнтів,
     /// які не шлють `VAEncPackedHeader*`. Коли `false`, клієнт сам веде
@@ -56,7 +63,47 @@ pub struct EncoderConfig {
     pub repeat_sps_pps: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HrdBuffer {
+    pub size_bits: u32,
+    pub initial_fullness_bits: u32,
+}
+
 impl EncoderConfig {
+    /// Rate updates leave queued picture layouts and coding tools unchanged.
+    pub fn is_rate_update_from(&self, previous: &Self) -> bool {
+        *self
+            == Self {
+                bitrate_bps: self.bitrate_bps,
+                max_bitrate_bps: self.max_bitrate_bps,
+                fps_num: self.fps_num,
+                fps_den: self.fps_den,
+                window_size_ms: self.window_size_ms,
+                hrd: self.hrd,
+                ..*previous
+            }
+    }
+
+    pub fn validate_rate_control(&self) -> Result<(), crate::error::DriverError> {
+        if self.qp > 51
+            || self.initial_qp > 51
+            || self.min_qp > 51
+            || self.max_qp > 51
+            || (self.min_qp != 0 && self.max_qp != 0 && self.min_qp > self.max_qp)
+            || self
+                .hrd
+                .is_some_and(|hrd| hrd.size_bits == 0 || hrd.initial_fullness_bits > hrd.size_bits)
+            || (self.hrd.is_none()
+                && u64::from(self.max_bitrate_bps.max(self.bitrate_bps))
+                    * u64::from(self.window_size_ms)
+                    / 1000
+                    > u64::from(u32::MAX))
+        {
+            return Err(crate::error::DriverError::InvalidParameter);
+        }
+        Ok(())
+    }
+
     /// Дефолт: 60 fps, 5 Mbps CBR, GOP = 120 кадрів (2 с), repeat_sps_pps=true.
     /// Клієнти, що драйвлять свій SPS через PackedHeaderData (Chromium),
     /// отримують `repeat_sps_pps=false` через `reconfigure` у `end_picture`.
@@ -67,9 +114,16 @@ impl EncoderConfig {
             fps_num: 60,
             fps_den: 1,
             bitrate_bps: 5_000_000,
+            max_bitrate_bps: 5_000_000,
             gop_length: 120,
             profile,
             rc_mode: preset::RcMode::Cbr,
+            qp: 28,
+            initial_qp: 0,
+            min_qp: 0,
+            max_qp: 0,
+            window_size_ms: 0,
+            hrd: None,
             repeat_sps_pps: true,
         }
     }
@@ -84,9 +138,7 @@ fn per_frame_bits(bitrate_bps: u32, fps_num: u32, fps_den: u32) -> u32 {
     }
     // ((bitrate * fps_den) / fps_num) у u64, щоб не переповнити u32 на
     // високих bitrate-ах (10 Mbps * 1001 = ~10 G, поміщається в u64).
-    let per = (bitrate_bps as u64)
-        .saturating_mul(fps_den as u64)
-        / (fps_num as u64);
+    let per = (bitrate_bps as u64).saturating_mul(fps_den as u64) / (fps_num as u64);
     per.min(u32::MAX as u64) as u32
 }
 
@@ -140,20 +192,48 @@ pub fn apply_config(preset_cfg: &mut nv::NV_ENC_CONFIG, cfg: &EncoderConfig) {
         preset::RcMode::Vbr => {
             rc.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
             rc.averageBitRate = cfg.bitrate_bps;
-            // maxBitRate лишаємо як preset поставив, або дублюємо.
-            if rc.maxBitRate < cfg.bitrate_bps {
-                rc.maxBitRate = cfg.bitrate_bps;
-            }
+            rc.maxBitRate = cfg.max_bitrate_bps.max(cfg.bitrate_bps);
+            rc.vbvBufferSize = 0;
+            rc.vbvInitialDelay = 0;
         }
         preset::RcMode::ConstQp => {
             rc.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
             // Розумний default — QP 28 (Discord-типовий сценарій);
             // точний QP прийде у c.2 з VAEncMiscParameterQP.
             rc.constQP = nv::NV_ENC_QP {
-                qpInterP: 28,
-                qpInterB: 28,
-                qpIntra: 28,
+                qpInterP: cfg.qp,
+                qpInterB: cfg.qp,
+                qpIntra: cfg.qp,
             };
+        }
+    }
+
+    if !matches!(cfg.rc_mode, preset::RcMode::ConstQp) {
+        let qp = |value| nv::NV_ENC_QP {
+            qpInterP: value,
+            qpInterB: value,
+            qpIntra: value,
+        };
+        rc.set_enableMinQP(u32::from(cfg.min_qp != 0));
+        rc.set_enableMaxQP(u32::from(cfg.max_qp != 0));
+        rc.set_enableInitialRCQP(u32::from(cfg.initial_qp != 0));
+        rc.minQP = qp(cfg.min_qp);
+        rc.maxQP = qp(cfg.max_qp);
+        rc.initialRCQP = qp(cfg.initial_qp);
+        let buffer = cfg.hrd.or_else(|| {
+            (cfg.window_size_ms != 0).then(|| {
+                let peak = rc.maxBitRate.max(rc.averageBitRate);
+                // The caller validates this product before configuring NVENC.
+                let size_bits = (u64::from(peak) * u64::from(cfg.window_size_ms) / 1000) as u32;
+                HrdBuffer {
+                    size_bits,
+                    initial_fullness_bits: size_bits / 2,
+                }
+            })
+        });
+        if let Some(buffer) = buffer {
+            rc.vbvBufferSize = buffer.size_bits;
+            rc.vbvInitialDelay = buffer.initial_fullness_bits;
         }
     }
 
@@ -179,10 +259,12 @@ pub fn apply_config(preset_cfg: &mut nv::NV_ENC_CONFIG, cfg: &EncoderConfig) {
     h264.sliceModeData = 1; // 1 slice per frame
     h264.chromaFormatIDC = 1; // 4:2:0
     h264.entropyCodingMode = match cfg.profile {
-        H264Profile::Main | H264Profile::High =>
-            nv::NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC,
-        H264Profile::ConstrainedBaseline =>
-            nv::NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC,
+        H264Profile::Main | H264Profile::High => {
+            nv::NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC
+        }
+        H264Profile::ConstrainedBaseline => {
+            nv::NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC
+        }
     };
     // `repeatSPSPPS` керується з `EncoderConfig`: ffmpeg-like клієнти
     // хочуть SPS+PPS на кожному IDR від енкодера, WebRTC/Chromium — ні
@@ -211,24 +293,19 @@ mod tests {
     /// Preset-default емуляція: zero-filled NV_ENC_CONFIG.
     ///
     /// # Safety
-    /// NVENC-структури `#[repr(C)]`, всі поля — POD (u32 / enum з варіантом 0 /
-    /// вкладений union зі spare-варіантом). Zero — валідний біт-паттерн.
+    /// Initialise the nonzero frame-field enum before forming a Rust config.
     fn zeroed_preset() -> nv::NV_ENC_CONFIG {
-        unsafe { MaybeUninit::<nv::NV_ENC_CONFIG>::zeroed().assume_init() }
+        let mut storage = MaybeUninit::<nv::NV_ENC_CONFIG>::zeroed();
+        // SAFETY: initialise the only nonzero Rust enum before assuming init.
+        unsafe {
+            core::ptr::addr_of_mut!((*storage.as_mut_ptr()).frameFieldMode)
+                .write(nv::NV_ENC_PARAMS_FRAME_FIELD_MODE::NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME);
+            storage.assume_init()
+        }
     }
 
     fn default_1080p60_cbr() -> EncoderConfig {
-        EncoderConfig {
-            width: 1920,
-            height: 1080,
-            fps_num: 60,
-            fps_den: 1,
-            bitrate_bps: 5_000_000,
-            gop_length: 120,
-            profile: H264Profile::Main,
-            rc_mode: preset::RcMode::Cbr,
-            repeat_sps_pps: true,
-        }
+        EncoderConfig::default_for(1920, 1080, H264Profile::Main)
     }
 
     #[test]
@@ -323,10 +400,13 @@ mod tests {
             fps_num: 24_000,
             fps_den: 1001, // 23.976
             bitrate_bps: 500_000,
+            max_bitrate_bps: 500_000,
             gop_length: 1,
             profile: H264Profile::Main,
             rc_mode: preset::RcMode::Cbr,
+            qp: 28,
             repeat_sps_pps: true,
+            ..default_1080p60_cbr()
         };
         apply_config(&mut cfg, &ec);
         assert_eq!(cfg.gopLength, 1);
@@ -386,5 +466,189 @@ mod tests {
         // VBV = 1 s of bitrate; initial delay = 500 ms.
         assert_eq!(cfg.rcParams.vbvBufferSize, 10_000_000);
         assert_eq!(cfg.rcParams.vbvInitialDelay, 5_000_000);
+    }
+    #[test]
+    fn vbr_retains_separate_average_and_peak_and_cqp_honours_client_qp() {
+        let mut config = zeroed_preset();
+        let mut request = default_1080p60_cbr();
+        request.rc_mode = preset::RcMode::Vbr;
+        request.bitrate_bps = 2_000_000;
+        request.max_bitrate_bps = 4_000_000;
+        apply_config(&mut config, &request);
+        assert_eq!(config.rcParams.averageBitRate, 2_000_000);
+        assert_eq!(config.rcParams.maxBitRate, 4_000_000);
+        request.rc_mode = preset::RcMode::ConstQp;
+        request.qp = 20;
+        apply_config(&mut config, &request);
+        assert_eq!(config.rcParams.constQP.qpIntra, 20);
+        assert_eq!(config.rcParams.constQP.qpInterP, 20);
+    }
+
+    #[test]
+    fn client_qp_limits_and_hrd_override_defaults_in_bitrate_modes() {
+        for mode in [preset::RcMode::Cbr, preset::RcMode::Vbr] {
+            let mut config = zeroed_preset();
+            let mut request = default_1080p60_cbr();
+            request.rc_mode = mode;
+            request.initial_qp = 26;
+            request.min_qp = 10;
+            request.max_qp = 42;
+            request.window_size_ms = 1500;
+            request.hrd = Some(HrdBuffer {
+                size_bits: 6_000_000,
+                initial_fullness_bits: 2_000_000,
+            });
+            apply_config(&mut config, &request);
+            assert_eq!(config.rcParams.enableMinQP(), 1);
+            assert_eq!(config.rcParams.enableMaxQP(), 1);
+            assert_eq!(config.rcParams.enableInitialRCQP(), 1);
+            assert_eq!(config.rcParams.minQP.qpInterP, 10);
+            assert_eq!(config.rcParams.maxQP.qpIntra, 42);
+            assert_eq!(config.rcParams.initialRCQP.qpInterP, 26);
+            assert_eq!(config.rcParams.vbvBufferSize, 6_000_000);
+            assert_eq!(config.rcParams.vbvInitialDelay, 2_000_000);
+        }
+    }
+
+    #[test]
+    fn rate_window_tracks_peak_bitrate_when_hrd_is_absent() {
+        let mut config = zeroed_preset();
+        let mut request = default_1080p60_cbr();
+        request.rc_mode = preset::RcMode::Vbr;
+        request.bitrate_bps = 2_000_000;
+        request.max_bitrate_bps = 4_000_000;
+        request.window_size_ms = 1500;
+        apply_config(&mut config, &request);
+        assert_eq!(config.rcParams.vbvBufferSize, 6_000_000);
+        assert_eq!(config.rcParams.vbvInitialDelay, 3_000_000);
+    }
+
+    #[test]
+    fn clearing_client_controls_removes_stale_qp_limits_and_buffering() {
+        let mut config = zeroed_preset();
+        let mut request = default_1080p60_cbr();
+        request.min_qp = 10;
+        request.max_qp = 42;
+        request.initial_qp = 26;
+        request.hrd = Some(HrdBuffer {
+            size_bits: 8_000_000,
+            initial_fullness_bits: 4_000_000,
+        });
+        apply_config(&mut config, &request);
+        request = default_1080p60_cbr();
+        apply_config(&mut config, &request);
+        assert_eq!(config.rcParams.enableMinQP(), 0);
+        assert_eq!(config.rcParams.enableMaxQP(), 0);
+        assert_eq!(config.rcParams.enableInitialRCQP(), 0);
+        assert_eq!(config.rcParams.vbvBufferSize, 5_000_000);
+        request.rc_mode = preset::RcMode::Vbr;
+        apply_config(&mut config, &request);
+        assert_eq!(config.rcParams.vbvBufferSize, 0);
+        assert_eq!(config.rcParams.vbvInitialDelay, 0);
+    }
+
+    #[test]
+    fn invalid_rate_controls_are_rejected_without_clamping() {
+        let baseline = default_1080p60_cbr();
+        for bad in [
+            EncoderConfig {
+                min_qp: 52,
+                ..baseline
+            },
+            EncoderConfig {
+                max_qp: 52,
+                ..baseline
+            },
+            EncoderConfig {
+                initial_qp: 52,
+                ..baseline
+            },
+            EncoderConfig {
+                min_qp: 42,
+                max_qp: 10,
+                ..baseline
+            },
+            EncoderConfig {
+                hrd: Some(HrdBuffer {
+                    size_bits: 10,
+                    initial_fullness_bits: 11,
+                }),
+                ..baseline
+            },
+            EncoderConfig {
+                window_size_ms: u32::MAX,
+                ..baseline
+            },
+        ] {
+            assert!(bad.validate_rate_control().is_err(), "{bad:?}");
+        }
+        assert!(baseline.validate_rate_control().is_ok());
+        let exact = EncoderConfig {
+            hrd: Some(HrdBuffer {
+                size_bits: u32::MAX,
+                initial_fullness_bits: u32::MAX,
+            }),
+            ..baseline
+        };
+        assert!(exact.validate_rate_control().is_ok());
+    }
+
+    #[test]
+    fn queued_rate_updates_exclude_coding_tool_and_geometry_changes() {
+        let before = default_1080p60_cbr();
+        let rates = EncoderConfig {
+            bitrate_bps: 2_000_000,
+            max_bitrate_bps: 3_000_000,
+            fps_num: 30_000,
+            fps_den: 1001,
+            window_size_ms: 1500,
+            hrd: Some(HrdBuffer {
+                size_bits: 4_500_000,
+                initial_fullness_bits: 2_250_000,
+            }),
+            ..before
+        };
+        assert!(rates.is_rate_update_from(&before));
+        for changed in [
+            EncoderConfig {
+                width: 1280,
+                ..rates
+            },
+            EncoderConfig {
+                height: 720,
+                ..rates
+            },
+            EncoderConfig {
+                gop_length: 60,
+                ..rates
+            },
+            EncoderConfig {
+                profile: H264Profile::High,
+                ..rates
+            },
+            EncoderConfig {
+                rc_mode: preset::RcMode::Vbr,
+                ..rates
+            },
+            EncoderConfig { qp: 20, ..rates },
+            EncoderConfig {
+                initial_qp: 26,
+                ..rates
+            },
+            EncoderConfig {
+                min_qp: 10,
+                ..rates
+            },
+            EncoderConfig {
+                max_qp: 42,
+                ..rates
+            },
+            EncoderConfig {
+                repeat_sps_pps: false,
+                ..rates
+            },
+        ] {
+            assert!(!changed.is_rate_update_from(&before), "{changed:?}");
+        }
     }
 }

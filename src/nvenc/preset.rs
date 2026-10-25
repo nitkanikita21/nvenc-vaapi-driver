@@ -9,13 +9,13 @@
 //!
 //! | Condition | Preset | Tuning | RC | AQ |
 //! |-----------|--------|--------|----|----|
-//! | `rc_wants_cqp` (any bitrate / fps) | P4 | LowLatency | ConstQP | no |
+//! | `rc_wants_cqp` (any bitrate / fps) | P4 | UltraLowLatency | ConstQP | no |
 //! | bitrate ≤ 2.5 Mbps **and** fps ≤ 30 | P3 | UltraLowLatency | CBR | no |
-//! | 2.5 Mbps < bitrate ≤ 6 Mbps **or** fps ≤ 60 | P4 | LowLatency | CBR | yes |
-//! | bitrate > 6 Mbps **or** fps > 60 | P5 | LowLatency | CBR | yes |
+//! | 2.5 Mbps < bitrate ≤ 6 Mbps **or** fps ≤ 60 | P4 | UltraLowLatency | CBR | yes |
+//! | bitrate > 6 Mbps **or** fps > 60 | P5 | UltraLowLatency | CBR | yes |
 //!
 //! The P3/ULL/CBR row targets Discord's "720p @ 30 fps, 2 Mbps" screenshare
-//! preset, where NVENC's ultra-low-latency tuning minimises encode-to-decode
+//! preset. All presets use ultra-low-latency tuning for synchronous output; it minimises encode-to-decode
 //! delay at the expense of slightly lower quality. AQ (Adaptive Quantization)
 //! is disabled there to reduce the per-frame decision overhead, which matters
 //! at 30 fps where the encoder has ≈33 ms to finish before the next frame
@@ -88,7 +88,7 @@ pub fn choose(bitrate_bps: u64, fps: u32, rc_wants_cqp: bool) -> PresetChoice {
     if rc_wants_cqp {
         return PresetChoice {
             preset: NvencPreset::P4,
-            tuning: Tuning::LowLatency,
+            tuning: Tuning::UltraLowLatency,
             rc: RcMode::ConstQp,
             enable_aq: false,
         };
@@ -113,14 +113,14 @@ pub fn choose(bitrate_bps: u64, fps: u32, rc_wants_cqp: bool) -> PresetChoice {
     } else if bitrate_bps <= 6_000_000 && fps <= 60 {
         PresetChoice {
             preset: NvencPreset::P4,
-            tuning: Tuning::LowLatency,
+            tuning: Tuning::UltraLowLatency,
             rc: RcMode::Cbr,
             enable_aq: true,
         }
     } else {
         PresetChoice {
             preset: NvencPreset::P5,
-            tuning: Tuning::LowLatency,
+            tuning: Tuning::UltraLowLatency,
             rc: RcMode::Cbr,
             enable_aq: true,
         }
@@ -188,7 +188,9 @@ mod tests {
     fn plan_table_1mbps_30fps() {
         assert_row(&Row {
             name: "1 Mbps @ 30 fps",
-            bitrate_bps: 1_000_000, fps: 30, cqp: false,
+            bitrate_bps: 1_000_000,
+            fps: 30,
+            cqp: false,
             expect_preset: NvencPreset::P3,
             expect_tuning: Tuning::UltraLowLatency,
             expect_rc: RcMode::Cbr,
@@ -200,9 +202,11 @@ mod tests {
     fn plan_table_5mbps_60fps() {
         assert_row(&Row {
             name: "5 Mbps @ 60 fps",
-            bitrate_bps: 5_000_000, fps: 60, cqp: false,
+            bitrate_bps: 5_000_000,
+            fps: 60,
+            cqp: false,
             expect_preset: NvencPreset::P4,
-            expect_tuning: Tuning::LowLatency,
+            expect_tuning: Tuning::UltraLowLatency,
             expect_rc: RcMode::Cbr,
             expect_aq: true,
         });
@@ -212,9 +216,11 @@ mod tests {
     fn plan_table_10mbps_60fps() {
         assert_row(&Row {
             name: "10 Mbps @ 60 fps",
-            bitrate_bps: 10_000_000, fps: 60, cqp: false,
+            bitrate_bps: 10_000_000,
+            fps: 60,
+            cqp: false,
             expect_preset: NvencPreset::P5,
-            expect_tuning: Tuning::LowLatency,
+            expect_tuning: Tuning::UltraLowLatency,
             expect_rc: RcMode::Cbr,
             expect_aq: true,
         });
@@ -224,9 +230,11 @@ mod tests {
     fn plan_table_cqp_overrides_to_p4_ll_constqp() {
         assert_row(&Row {
             name: "CQP override",
-            bitrate_bps: 4_000_000, fps: 60, cqp: true,
+            bitrate_bps: 4_000_000,
+            fps: 60,
+            cqp: true,
             expect_preset: NvencPreset::P4,
-            expect_tuning: Tuning::LowLatency,
+            expect_tuning: Tuning::UltraLowLatency,
             expect_rc: RcMode::ConstQp,
             expect_aq: false,
         });
@@ -239,7 +247,9 @@ mod tests {
         // The plan writes "≤ 2.5 Mbps" so exactly 2.5M must still land on P3+ULL.
         assert_row(&Row {
             name: "2.5 Mbps @ 30 fps (lower-row boundary)",
-            bitrate_bps: 2_500_000, fps: 30, cqp: false,
+            bitrate_bps: 2_500_000,
+            fps: 30,
+            cqp: false,
             expect_preset: NvencPreset::P3,
             expect_tuning: Tuning::UltraLowLatency,
             expect_rc: RcMode::Cbr,
@@ -251,9 +261,11 @@ mod tests {
     fn boundary_just_over_2_5mbps_is_p4() {
         assert_row(&Row {
             name: "2.500001 Mbps @ 30 fps",
-            bitrate_bps: 2_500_001, fps: 30, cqp: false,
+            bitrate_bps: 2_500_001,
+            fps: 30,
+            cqp: false,
             expect_preset: NvencPreset::P4,
-            expect_tuning: Tuning::LowLatency,
+            expect_tuning: Tuning::UltraLowLatency,
             expect_rc: RcMode::Cbr,
             expect_aq: true,
         });
@@ -264,9 +276,11 @@ mod tests {
         // The plan writes "2.5–6 Mbps" — exactly 6M still on P4 per impl.
         assert_row(&Row {
             name: "6 Mbps @ 60 fps (upper P4 boundary)",
-            bitrate_bps: 6_000_000, fps: 60, cqp: false,
+            bitrate_bps: 6_000_000,
+            fps: 60,
+            cqp: false,
             expect_preset: NvencPreset::P4,
-            expect_tuning: Tuning::LowLatency,
+            expect_tuning: Tuning::UltraLowLatency,
             expect_rc: RcMode::Cbr,
             expect_aq: true,
         });
@@ -276,9 +290,11 @@ mod tests {
     fn boundary_just_over_6mbps_is_p5() {
         assert_row(&Row {
             name: "6.000001 Mbps @ 60 fps",
-            bitrate_bps: 6_000_001, fps: 60, cqp: false,
+            bitrate_bps: 6_000_001,
+            fps: 60,
+            cqp: false,
             expect_preset: NvencPreset::P5,
-            expect_tuning: Tuning::LowLatency,
+            expect_tuning: Tuning::UltraLowLatency,
             expect_rc: RcMode::Cbr,
             expect_aq: true,
         });
@@ -300,7 +316,7 @@ mod tests {
         // CQP override must short-circuit regardless of bitrate band.
         let c = choose(50_000_000, 120, true);
         assert_eq!(c.preset, NvencPreset::P4);
-        assert_eq!(c.tuning, Tuning::LowLatency);
+        assert_eq!(c.tuning, Tuning::UltraLowLatency);
         assert_eq!(c.rc, RcMode::ConstQp);
         assert!(!c.enable_aq);
     }

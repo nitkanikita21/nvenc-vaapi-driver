@@ -1,0 +1,26 @@
+name: Checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  cpu-and-abi:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install build dependencies (no NVIDIA libraries)
+        run: pacman -Syu --noconfirm --needed git clang libva rustup python
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup default stable
+          rustup component add clippy
+      - name: CPU and shared-library ABI regressions
+        run: cargo test --locked --all-targets --all-features
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Installer regressions
+        run: python3 -m unittest discover -s tools/tests -v
+      - name: Whitespace
+        run: git -c safe.directory="$GITHUB_WORKSPACE" diff --check

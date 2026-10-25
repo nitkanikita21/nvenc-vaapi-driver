@@ -8,9 +8,9 @@
 //! Supported RC modes: `VA_RC_CBR | VA_RC_VBR | VA_RC_CQP`.
 
 use super::{DriverState, guard, state_from};
+use crate::driver::state::ConfigRec;
 use crate::error::{DriverError, VAStatus};
 use crate::ids::{ConfigKey, ContainsKey, key_to_id};
-use crate::driver::state::ConfigRec;
 use core::ffi::c_int;
 use va_sys as va;
 
@@ -85,26 +85,17 @@ pub unsafe extern "C" fn get_config_attributes(
             return Err(DriverError::UnsupportedEntrypoint);
         }
         // SAFETY: caller provides a valid array of `num_attribs` entries.
-        let attrs = unsafe {
-            core::slice::from_raw_parts_mut(attrib_list, num_attribs as usize)
-        };
+        let attrs = unsafe { core::slice::from_raw_parts_mut(attrib_list, num_attribs as usize) };
         for a in attrs {
             a.value = match a.type_ {
                 va::VAConfigAttribRTFormat => va::VA_RT_FORMAT_YUV420,
-                va::VAConfigAttribRateControl => {
-                    va::VA_RC_CBR | va::VA_RC_VBR | va::VA_RC_CQP
-                }
-                va::VAConfigAttribEncPackedHeaders => {
-                    va::VA_ENC_PACKED_HEADER_SEQUENCE
-                        | va::VA_ENC_PACKED_HEADER_PICTURE
-                        | va::VA_ENC_PACKED_HEADER_SLICE
-                }
+                va::VAConfigAttribRateControl => va::VA_RC_CBR | va::VA_RC_VBR | va::VA_RC_CQP,
+                // NVENC generates headers; client bytes are not passed through.
+                va::VAConfigAttribEncPackedHeaders => 0,
                 va::VAConfigAttribEncMaxRefFrames => 1,
                 va::VAConfigAttribEncInterlaced => va::VA_ENC_INTERLACED_NONE,
                 va::VAConfigAttribEncMaxSlices => 1,
-                va::VAConfigAttribEncSliceStructure => {
-                    va::VA_ENC_SLICE_STRUCTURE_POWER_OF_TWO_ROWS
-                }
+                va::VAConfigAttribEncSliceStructure => va::VA_ENC_SLICE_STRUCTURE_POWER_OF_TWO_ROWS,
                 _ => va::VA_ATTRIB_NOT_SUPPORTED,
             };
         }
@@ -123,7 +114,7 @@ pub unsafe extern "C" fn create_config(
     guard(|| {
         // SAFETY: ctx validity delegated to libva.
         let state = unsafe { state_from(ctx) }.ok_or(DriverError::InvalidParameter)?;
-        if config_id.is_null() {
+        if config_id.is_null() || num_attribs < 0 || (num_attribs > 0 && attrib_list.is_null()) {
             return Err(DriverError::InvalidParameter);
         }
         if !SUPPORTED_PROFILES.contains(&profile) {
@@ -144,13 +135,23 @@ pub unsafe extern "C" fn create_config(
         for a in attrs {
             match a.type_ {
                 va::VAConfigAttribRTFormat => {
-                    if a.value & va::VA_RT_FORMAT_YUV420 == 0 {
+                    if a.value != va::VA_RT_FORMAT_YUV420 {
                         return Err(DriverError::UnsupportedRtFormat);
                     }
                     rt_format = a.value;
                 }
-                va::VAConfigAttribRateControl => rc_mode = a.value,
-                va::VAConfigAttribEncPackedHeaders => packed = a.value,
+                va::VAConfigAttribRateControl => {
+                    if ![va::VA_RC_CBR, va::VA_RC_VBR, va::VA_RC_CQP].contains(&a.value) {
+                        return Err(DriverError::AttrNotSupported);
+                    }
+                    rc_mode = a.value;
+                }
+                va::VAConfigAttribEncPackedHeaders => {
+                    if a.value != 0 {
+                        return Err(DriverError::AttrNotSupported);
+                    }
+                    packed = a.value;
+                }
                 _ => {}
             }
         }
@@ -162,7 +163,7 @@ pub unsafe extern "C" fn create_config(
             packed_headers: packed,
         };
         let mut pools = state.pools.lock();
-        let k: ConfigKey = pools.configs.insert(rec);
+        let k: ConfigKey = pools.configs.insert(rec)?;
         // SAFETY: config_id non-null per check above.
         unsafe { *config_id = key_to_id(k) as va::VAConfigID };
         Ok(())
@@ -179,7 +180,7 @@ pub unsafe extern "C" fn destroy_config(
         let mut pools = state.pools.lock();
         let k: ConfigKey = pools
             .configs
-            .find_by_low_bits(config_id as u32)
+            .find_by_low_bits(config_id)
             .ok_or(DriverError::InvalidConfig)?;
         pools.configs.remove(k);
         Ok(())
@@ -207,9 +208,8 @@ fn config_attribs() -> [va::VAConfigAttrib; 6] {
         },
         va::VAConfigAttrib {
             type_: va::VAConfigAttribEncPackedHeaders,
-            // SEQUENCE | PICTURE | SLICE = 0x7; same set we advertise from
-            // vaGetConfigAttributes.
-            value: 0x7,
+            // The encoder owns SPS/PPS/slice headers.
+            value: 0,
         },
         va::VAConfigAttrib {
             type_: va::VAConfigAttribEncMaxRefFrames,
@@ -244,10 +244,13 @@ pub unsafe extern "C" fn query_config_attributes(
         let pools = state.pools.lock();
         let k: ConfigKey = pools
             .configs
-            .find_by_low_bits(config_id as u32)
+            .find_by_low_bits(config_id)
             .ok_or(DriverError::InvalidConfig)?;
         let rec = &pools.configs[k];
-        let attribs = config_attribs();
+        let mut attribs = config_attribs();
+        attribs[0].value = rec.rt_format;
+        attribs[1].value = rec.rc_mode;
+        attribs[2].value = rec.packed_headers;
         // SAFETY: out pointers owned by libva client; `num_attribs` is required,
         // the rest may be null if the caller only wants a subset of fields.
         unsafe {
@@ -270,5 +273,5 @@ pub unsafe extern "C" fn query_config_attributes(
 
 /// `find_key` by low bits for Configs (helper used by other modules).
 pub fn find_config(state: &DriverState, id: va::VAConfigID) -> Option<ConfigKey> {
-    state.pools.lock().configs.find_by_low_bits(id as u32)
+    state.pools.lock().configs.find_by_low_bits(id)
 }

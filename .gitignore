@@ -9,3 +9,6 @@
 # Generated outputs during local testing
 *.h264
 out.h264
+
+# Python helper caches
+__pycache__/

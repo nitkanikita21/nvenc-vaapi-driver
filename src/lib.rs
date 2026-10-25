@@ -59,9 +59,10 @@ mod h264;
 mod ids;
 mod logging;
 mod nvenc;
+mod profiling;
 
 use crate::driver::DriverState;
-use crate::error::{VAStatus, VA_STATUS_SUCCESS, VA_STATUS_UNKNOWN};
+use crate::error::{VA_STATUS_SUCCESS, VA_STATUS_UNKNOWN, VAStatus};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use va_sys as va;
 
@@ -83,6 +84,9 @@ unsafe fn driver_init_inner(ctx: va::VADriverContextP) -> VAStatus {
     }
     // SAFETY: caller guarantees ctx is a valid VADriverContext.
     let ctx_ref = unsafe { &mut *ctx };
+    if ctx_ref.vtable.is_null() || !ctx_ref.pDriverData.is_null() {
+        return error::DriverError::InvalidParameter.to_status();
+    }
 
     // 1. Allocate driver state.
     let state = match DriverState::new(ctx) {
@@ -200,12 +204,16 @@ fn install_vtable(vt: &mut va::VADriverVTable) {
 
 unsafe extern "C" fn terminate(ctx: va::VADriverContextP) -> VAStatus {
     match catch_unwind(AssertUnwindSafe(|| unsafe {
-        if ctx.is_null() { return VA_STATUS_SUCCESS; }
+        if ctx.is_null() {
+            return VA_STATUS_SUCCESS;
+        }
         let p = (*ctx).pDriverData as *mut DriverState;
         if !p.is_null() {
             // SAFETY: pDriverData came from Box::into_raw in driver_init.
             drop(Box::from_raw(p));
             (*ctx).pDriverData = core::ptr::null_mut();
+            #[cfg(feature = "profiling")]
+            crate::profiling::report();
         }
         VA_STATUS_SUCCESS
     })) {
@@ -221,6 +229,8 @@ unsafe extern "C" fn terminate(ctx: va::VADriverContextP) -> VAStatus {
 
 macro_rules! va_init_export {
     ($name:literal, $fn:ident) => {
+        /// # Safety
+        /// `ctx` must be a live, initialised libva backend context with a vtable.
         #[unsafe(export_name = $name)]
         pub unsafe extern "C" fn $fn(ctx: va::VADriverContextP) -> VAStatus {
             // SAFETY: libva passes a valid driver context.
@@ -229,16 +239,16 @@ macro_rules! va_init_export {
     };
 }
 
-va_init_export!("__vaDriverInit_1_0",  __va_init_1_0);
-va_init_export!("__vaDriverInit_1_1",  __va_init_1_1);
-va_init_export!("__vaDriverInit_1_2",  __va_init_1_2);
-va_init_export!("__vaDriverInit_1_3",  __va_init_1_3);
-va_init_export!("__vaDriverInit_1_4",  __va_init_1_4);
-va_init_export!("__vaDriverInit_1_5",  __va_init_1_5);
-va_init_export!("__vaDriverInit_1_6",  __va_init_1_6);
-va_init_export!("__vaDriverInit_1_7",  __va_init_1_7);
-va_init_export!("__vaDriverInit_1_8",  __va_init_1_8);
-va_init_export!("__vaDriverInit_1_9",  __va_init_1_9);
+va_init_export!("__vaDriverInit_1_0", __va_init_1_0);
+va_init_export!("__vaDriverInit_1_1", __va_init_1_1);
+va_init_export!("__vaDriverInit_1_2", __va_init_1_2);
+va_init_export!("__vaDriverInit_1_3", __va_init_1_3);
+va_init_export!("__vaDriverInit_1_4", __va_init_1_4);
+va_init_export!("__vaDriverInit_1_5", __va_init_1_5);
+va_init_export!("__vaDriverInit_1_6", __va_init_1_6);
+va_init_export!("__vaDriverInit_1_7", __va_init_1_7);
+va_init_export!("__vaDriverInit_1_8", __va_init_1_8);
+va_init_export!("__vaDriverInit_1_9", __va_init_1_9);
 va_init_export!("__vaDriverInit_1_10", __va_init_1_10);
 va_init_export!("__vaDriverInit_1_11", __va_init_1_11);
 va_init_export!("__vaDriverInit_1_12", __va_init_1_12);
@@ -253,4 +263,3 @@ va_init_export!("__vaDriverInit_1_20", __va_init_1_20);
 va_init_export!("__vaDriverInit_1_21", __va_init_1_21);
 va_init_export!("__vaDriverInit_1_22", __va_init_1_22);
 va_init_export!("__vaDriverInit_1_23", __va_init_1_23);
-

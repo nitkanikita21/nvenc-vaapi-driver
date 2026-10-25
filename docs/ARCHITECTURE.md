@@ -1,538 +1,90 @@
-# Architecture: nvenc-vaapi-driver
-
-This document describes the internal design of the driver for contributors:
-the VAAPI ABI contract, the complete encode-call lifecycle from `vaInitialize`
-to `vaSyncBuffer`, the DMA-BUF zero-copy path, the preset manager, the dynamic
-rate-control path, the ABI safety model, and the threading model.
-
----
-
-## Component Diagram
-
-```
-Chromium / Discord (Electron) / OBS / ffmpeg
-        |
-        |  VAAPI client API (vaInitialize, vaCreateConfig, vaBeginPicture, ...)
-        v
-   libva.so.2  (system)
-        |
-        |  dlopen("$LIBVA_DRIVERS_PATH/nvidia_nvenc_drv_video.so")
-        |  dlsym("__vaDriverInit_1_23")   // tries latest minor first
-        |  dlsym("__vaDriverInit_1_22")   // fallback
-        |  ...
-        v
-+------------------------------------------------------------------+
-|              libnvidia_nvenc_drv_video.so                        |
-|                                                                  |
-|   src/lib.rs                                                     |
-|   __vaDriverInit_1_{0..23}  (24 aliases, all -> driver_init)    |
-|          |                                                       |
-|          v                                                       |
-|   DriverState  (Box<>, ctx->pDriverData)                        |
-|     +-  CudaCtx          (DRM fd -> CUDA context)               |
-|     +-  Mutex<Pools>                                             |
-|           +-  DenseSlotMap<ConfigKey,  ConfigRec>               |
-|           +-  DenseSlotMap<SurfaceKey, SurfaceRec>              |
-|           +-  DenseSlotMap<ContextKey, ContextRec>              |
-|           +-  DenseSlotMap<BufferKey,  BufferRec>               |
-|           +-  DenseSlotMap<ImageKey,   ImageRec>                |
-|                                                                  |
-|   VADriverVTable  (ctx->vtable)                                  |
-|     driver/config.rs    vaCreateConfig / vaQueryConfigProfiles   |
-|     driver/surface.rs   vaCreateSurfaces / DMA-BUF import       |
-|     driver/context.rs   vaCreateContext / vaDestroyContext       |
-|     driver/buffer.rs    vaCreateBuffer / vaMapBuffer             |
-|     driver/picture.rs   vaBeginPicture / vaRenderPicture /       |
-|                         vaEndPicture (rate-control reconfigure)  |
-|     driver/sync.rs      vaSyncSurface / vaSyncBuffer            |
-|     driver/image.rs     stubs (libva validator requires non-NULL)|
-|     driver/export.rs    vaExportSurfaceHandle (stub, post-MVP)  |
-|                                                                  |
-|   src/nvenc/preset.rs   bitrate/fps -> NvencPreset + Tuning + RC|
-|   src/nvenc/session.rs  NvencSession (encode-lock-unmap cycle)  |
-|   src/nvenc/h264_config.rs  apply_config(): mutates NV_ENC_CONFIG|
-|   src/cuda/             cudarc adapter, external memory import  |
-|   src/h264/             VA* parameters -> EncoderConfig         |
-|   src/ids.rs            generational key <-> VA u32 ID          |
-|   crates/va-sys/        bindgen bindings for va_backend.h       |
-+------------------------------------------------------------------+
-        |
-        v
-   libnvidia-encode.so  +  libcuda.so
-        |
-        v
-   NVIDIA GPU (NVENC engine)
-```
-
----
-
-## VAAPI Backend ABI Contract
-
-VAAPI is a userspace hardware acceleration API standardised by Intel. The client
-side is `libva.so.2`; the hardware-specific side is a backend driver — a shared
-library loaded at runtime via `dlopen`.
-
-libva resolves a driver by name:
-
-```
-LIBVA_DRIVER_NAME=nvidia_nvenc
-  -> dlopen("$LIBVA_DRIVERS_PATH/nvidia_nvenc_drv_video.so")
-  -> dlsym("__vaDriverInit_1_23")   # tries latest minor first
-  -> dlsym("__vaDriverInit_1_22")   # falls back if not found
-  -> ...
-```
-
-The `__vaDriverInit_1_<minor>` symbol has the signature:
-
-```c
-VAStatus __vaDriverInit_1_23(VADriverContextP ctx);
-```
-
-On success the function must:
-
-1. Write `ctx->pDriverData` with a pointer to private driver state.
-2. Fill capability counts (`ctx->max_profiles`, `ctx->max_entrypoints`, etc.).
-3. Set `ctx->str_vendor` to a NUL-terminated static string.
-4. Populate `ctx->vtable` (a `VADriverVTable*` allocated by libva with `calloc`)
-   with function pointers for every VA operation the driver supports.
-
-libva's `va_NewDriverContext` validator then checks that certain vtable slots are
-non-NULL before returning to the caller. Every image and subpicture slot must be
-non-NULL even for an encode-only driver — see `src/driver/image.rs` for the stubs
-that satisfy this requirement. `ctx->max_subpic_formats` and
-`ctx->max_display_attributes` must also be positive or the validator rejects the
-driver.
-
-We export **24 aliases** (`__vaDriverInit_1_0` through `__vaDriverInit_1_23`) all
-pointing to the same `driver_init` function. This makes the driver loadable by
-any libva 1.x version without knowing the runtime minor at build time. The
-aliases are generated by a `va_init_export!` macro in `src/lib.rs`.
-
-The backend headers (`<va/va_backend.h>`, `<va/va.h>`, `<va/va_enc_h264.h>`,
-`<va/va_drmcommon.h>`) are consumed via the `va-sys` crate in `crates/va-sys/`,
-which generates Rust bindings with `bindgen 0.72`. The crate does **not** link
-against `libva` — it is the implementation side, not the consumer side.
-
-**Reference:** [libva source — va_openDriver](https://github.com/intel/libva/blob/main/va/va.c)
-
----
-
-## DriverState Lifecycle
-
-```
-__vaDriverInit_1_*
-    |
-    +--> DriverState::new(ctx)
-    |        +--> CudaCtx::from_va_context(ctx)   // dup the DRM fd
-    |        +--> Mutex::new(Pools::new())
-    |
-    +--> Box::new(state)
-    +--> ctx->pDriverData = Box::into_raw(state_box) as *mut c_void
-    |
-    [driver is live; vtable calls arrive]
-    |
-    +--> state_from(ctx): &DriverState
-    |        +--> ctx->pDriverData as *const DriverState
-    |        +--> &*ptr  (shared reference, held only within the guard closure)
-    |
-vaTerminate
-    +--> p = ctx->pDriverData as *mut DriverState
-    +--> Box::from_raw(p)   // reclaims heap allocation, runs Drop
-    +--> ctx->pDriverData = null_mut()
-```
-
-`Box::into_raw` / `Box::from_raw` is the canonical Rust pattern for crossing an
-FFI ownership boundary. The pointer is valid from `driver_init` until
-`vaTerminate`; every vtable function verifies it is non-null via `state_from`
-before dereferencing.
-
-`DriverState` owns:
-
-| Field | Type | Purpose |
-|-------|------|---------|
-| `cuda` | `CudaCtx` | Wraps the DRM fd and the CUDA context |
-| `pools` | `Mutex<Pools>` | All object pools guarded by a single mutex |
-
-`Pools` holds five `DenseSlotMap` instances keyed by the typed keys in
-`src/ids.rs`:
-
-| Pool | Key type | Contents |
-|------|----------|----------|
-| `configs` | `ConfigKey` | `ConfigRec` (profile, entrypoint, RT format, RC mode) |
-| `surfaces` | `SurfaceKey` | `SurfaceRec` (dimensions, format, backing memory kind) |
-| `contexts` | `ContextKey` | `ContextRec` (config ref, size, render targets, NVENC session) |
-| `buffers` | `BufferKey` | `BufferRec` (type, element count, heap storage, coded-ready flag) |
-| `images` | `ImageKey` | `ImageRec` (dimensions, format, backing buffer ref) |
-
----
-
-## Generational ID Translation
-
-libva exposes objects to clients as opaque `u32` IDs (`VAConfigID`,
-`VASurfaceID`, etc.). Internally we use `slotmap::DenseSlotMap` with typed
-keys. Each key holds a 64-bit `KeyData` value encoding both the slot index and a
-generation counter, so stale IDs from a removed slot are detected rather than
-silently aliasing a new entry.
-
-The translation functions (`key_to_id`, `id_to_key`) are in `src/ids.rs`:
-
-- `key_to_id`: truncates `KeyData` to 32 bits (discards upper 32 bits). Safe
-  for pools with far fewer than 2^16 live entries.
-- `id_to_key` / `find_by_low_bits`: linear scan over the pool comparing low 32
-  bits. Acceptable because pools stay small and this is off the encode hot path.
-
----
-
-## Full Encode-Call Lifecycle (Chromium screen share, happy path)
-
-Numbered steps from `vaInitialize` to `vaSyncBuffer`:
-
-1. `vaInitialize` calls `__vaDriverInit_1_23(ctx)`. We create `DriverState`:
-   `cuInit(0)`, select the CUDA device matching `ctx->drm_state->fd` (via
-   `cuDeviceGetByPCIBusId` after reading the PCI address from the DRM fd),
-   `cuCtxCreate`, `NvEncOpenEncodeSessionEx`. Store capability bits.
-2. `vaQueryConfigProfiles` returns `{H264ConstrainedBaseline, H264Main}`.
-3. `vaQueryConfigEntrypoints(profile)` returns `VAEntrypointEncSlice`.
-4. `vaGetConfigAttributes` returns `VAConfigAttribRTFormat=YUV420`,
-   `VAConfigAttribRateControl=CBR|VBR|CQP`,
-   `VAConfigAttribEncPackedHeaders=SEQUENCE|PICTURE|SLICE`,
-   `VAConfigAttribEncMaxRefFrames=1`.
-5. `vaCreateConfig` creates a `ConfigRec{profile, entrypoint, attrs}` and issues
-   a `VAConfigID`.
-6. `vaCreateSurfaces2` (NV12): `cuMemAllocPitch` for resident surfaces; stores
-   `CUdeviceptr + pitch`. For external DMA-BUF surfaces, handles
-   `VASurfaceAttribExternalBuffers` / `VASurfaceAttribMemoryType=DRM_PRIME_2`.
-7. `vaCreateContext`: builds `NV_ENC_INITIALIZE_PARAMS` (preset by table,
-   `enablePTD=1`, `frameIntervalP=1`, `idrPeriod=gopLength`). Registers the
-   surface pool via `NvEncRegisterResource`. Allocates a 6-slot bitstream pool
-   via `NvEncCreateBitstreamBuffer`.
-8. `vaCreateBuffer` for SPS, PPS, slice, coded-output buffer types — stores data
-   in heap-allocated `BufferRec`. The coded buffer is a reserved output slot.
-9. `vaBeginPicture(context, render_target)` — records `current_target`, clears
-   `PendingFrame`.
-10. `vaRenderPicture(context, buffers)` — classifies each buffer into
-    `PendingFrame` fields (seq_param, pic_param, slice_param, packed_headers,
-    coded_buf). `VAEncMiscParameterBufferType` subtypes 0 and 1 are parsed into
-    `misc_fps` and `misc_bitrate_bps` respectively.
-11. `vaEndPicture` (see also "Dynamic rate-control path" below):
-    - If `misc_bitrate_bps` or `misc_fps` changed, calls
-      `NvencSession::reconfigure` before encoding.
-    - If the client supplied a new SPS, parses it into `EncoderConfig` and
-      reconfigures if anything changed.
-    - Lazily registers the render target with NVENC if not already registered.
-    - Calls `NvEncMapInputResource` and `NvEncEncodePicture`. On
-      `NV_ENC_SUCCESS`, locks the bitstream, copies bytes, unlocks, and unmaps.
-      On `NV_ENC_ERR_NEED_MORE_INPUT`, marks the slot Pending and carries on.
-    - Writes a `VACodedBufferSegment` chain into the coded buffer's backing
-      storage and marks `coded_ready = true`.
-12. `vaSyncSurface` / `vaSyncBuffer` — by the time we return from `vaEndPicture`
-    the bitstream is already locked and copied; sync is effectively a no-op.
-13. Client reads through `vaMapBuffer(coded_buf_id)` — returns
-    `VACodedBufferSegment*` into the backing storage.
-
----
-
-## Dynamic Rate-Control Path
-
-Chromium's WebRTC `RateController` delivers bitrate and framerate updates
-through `VAEncMiscParameterBufferType` on nearly every frame. Ignoring these
-causes Chromium to classify the encoder as non-compliant and cycle it out in
-favour of software OpenH264 after a short trial window.
-
-The path through the driver is:
-
-1. **`render_picture`** (`src/driver/picture.rs`): receives a buffer of type
-   `VAEncMiscParameterBufferType`. Reads the first `u32` field as the misc
-   subtype:
-   - Subtype `0` (`VAEncMiscParameterTypeFrameRate`): decodes the next `u32` as
-     a packed `num | (den << 16)` framerate and stores it in
-     `PendingFrame::misc_fps` (`src/driver/state.rs`).
-   - Subtype `1` (`VAEncMiscParameterTypeRateControl`): reads the next `u32` as
-     `bits_per_second` and stores it in `PendingFrame::misc_bitrate_bps`.
-   - Other subtypes (HRD, MaxSliceSize, AIR, etc.) are accepted silently and
-     ignored; NVENC continues operating on its current rate-control state.
-
-2. **`end_picture`** (`src/driver/picture.rs`): after snapshotting the pending
-   state, checks whether `misc_bitrate_bps` or `misc_fps` is `Some`. If either
-   is set and differs from the current session config, builds a new
-   `EncoderConfig` with the updated values and calls `NvencSession::reconfigure`.
-
-3. **`NvencSession::reconfigure`** (`src/nvenc/session.rs`): fetches a fresh
-   preset config via `NvEncGetEncodePresetConfigEx`, applies the new
-   `EncoderConfig` via `h264_config::apply_config`, builds
-   `NV_ENC_RECONFIGURE_PARAMS` with `forceIDR=1`, and calls
-   `NvEncReconfigureEncoder`. The `forceIDR` flag ensures the decoder resyncs
-   cleanly on the bitrate boundary. On failure the old config is retained and
-   the error is logged; encoding continues with the previous parameters.
-
-The SPS-driven reconfigure path (`seq_bytes -> parse_sps -> build_cfg_from_sps`)
-runs after the misc-parameter path in `end_picture`. The two paths are
-independent; in practice Chromium sends MISC updates on every frame and SPS
-updates only on IDR frames.
-
----
-
-## Frame Encode Lifecycle
-
-```
-vaCreateConfig(profile=H264Main, entrypoint=EncSlice, attrs)
-    -> ConfigRec stored in pools.configs
-
-vaCreateSurfaces(w, h, YUV420, n)
-    -> n x SurfaceRec(Internal or ExternalDmaBuf) stored in pools.surfaces
-
-vaCreateContext(config, w, h, render_targets)
-    -> ContextRec stored in pools.contexts
-    -> NvencSession::new() on first vaEndPicture (or at context creation)
-
-vaCreateBuffer(EncSequenceParameterBufferType, ...)
-vaCreateBuffer(EncPictureParameterBufferType, ...)
-vaCreateBuffer(EncSliceParameterBufferType, ...)
-vaCreateBuffer(EncCodedBufferType, size, ...)
-
-vaBeginPicture(context, render_target)
-    -> sets context.current_target
-    -> clears PendingFrame
-
-vaRenderPicture(context, [sps_buf, pps_buf, slice_buf, misc_buf, coded_buf])
-    -> classifies each buffer into PendingFrame fields
-    -> parses VAEncMiscParameterType 0/1 into misc_fps / misc_bitrate_bps
-
-vaEndPicture(context)
-    -> apply misc rate-control update via NvencSession::reconfigure (forceIDR)
-    -> apply SPS-driven reconfigure if config changed
-    -> lazy-register render target with NVENC if not already registered
-    -> NvEncMapInputResource -> NvEncEncodePicture -> NvEncLockBitstream
-    -> write VACodedBufferSegment chain into coded buffer storage
-    -> coded_ready = true
-
-vaSyncSurface(render_target)
-    -> no-op (bitstream already written by vaEndPicture)
-
-vaMapBuffer(coded_buf_id, &ptr)
-    -> returns VACodedBufferSegment* into coded buffer backing storage
-
-[client reads bitstream from ptr]
-
-vaUnmapBuffer(coded_buf_id)
-    -> releases borrow on coded buffer storage
-
-vaDestroyBuffer / vaDestroyContext / vaDestroySurfaces / vaDestroyConfig
-    -> removes entries from respective slotmap pools
-```
-
----
-
-## DMA-BUF Zero-Copy Pipeline
-
-The zero-copy path for compositor-driven screen share:
-
-```
-Compositor (Wayland / KWin)
-    |
-    | DRM PRIME fd (dmabuf) for the captured frame
-    v
-vaCreateSurfaces2(attribs = VASurfaceAttribExternalBuffers{
-                      memory_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                      buffers = [fd, offset, pitch, ...] })
-    |
-    | dup(fd) stored in SurfaceRec { kind: ExternalDmaBuf { image, registered_nvenc } }
-    v
-On first encode (vaEndPicture):
-    cuImportExternalMemory(descriptor{
-        type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
-        fd = dup'd fd })
-    |
-    cuExternalMemoryGetMappedMipmappedArray(...)
-    |
-    NvEncRegisterResource(NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY, ...)
-    |   -> cached in SurfaceRec::registered_nvenc (OnceLock<usize>)
-    v
-NvEncMapInputResource(registered_ptr)
-    |
-    NvEncEncodePicture(inputBuffer = mapped_ptr, ...)
-    |
-NvEncUnmapInputResource / NvEncUnregisterResource on surface destroy
-```
-
-This path avoids any CPU-side copy: the compositor's GPU buffer is mapped
-directly into the CUDA address space and handed to NVENC. The `dup` of the DRM
-fd ensures the driver holds its own reference independent of the compositor's
-buffer lifetime.
-
-The drop ordering is critical: `NvEncUnregisterResource` must happen before the
-CUDA external memory and mipmap are destroyed (`ExternalDmaBufImage` Drop).
-`destroy_surfaces` in `src/driver/surface.rs` handles this sequencing explicitly.
-
-Currently only single-object NV12 DMA-BUF layouts are supported. Multi-object
-layouts (separate Y and UV file descriptors) return
-`VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE`.
-
-**Reference:** [VAAPI DRM common header](https://github.com/intel/libva/blob/main/va/va_drmcommon.h),
-[CUDA External Memory API](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXTRES__INTEROP.html)
-
----
-
-## Preset Selection
-
-The preset/tuning/RC-mode selection logic lives in `src/nvenc/preset.rs` and is
-**deliberately isolated** from NVENC types so it can be compiled and tested on
-any machine without CUDA.
-
-Decision table (optimised for Discord screen-share bitrate tiers):
-
-| Condition | NVENC preset | Tuning | RC mode | AQ |
-|---|---|---|---|---|
-| `rc_wants_cqp` (any bitrate/fps) | P4 | `LowLatency` | `ConstQP` | no |
-| bitrate <= 2.5 Mbps **and** fps <= 30 | P3 | `UltraLowLatency` | `CBR` | no |
-| 2.5 Mbps < bitrate <= 6 Mbps **or** fps <= 60 | P4 | `LowLatency` | `CBR` | yes |
-| bitrate > 6 Mbps **or** fps > 60 | P5 | `LowLatency` | `CBR` | yes |
-
-The P3/ULL/CBR row targets Discord "720p @ 30 fps, 2 Mbps" — minimum encode
-latency at the cost of slightly lower quality. AQ is disabled there to reduce
-per-frame overhead (at 30 fps the encoder has ~33 ms until the next frame). At
-higher bitrates (P4/P5 + AQ) the overhead is justified by quality improvements
-in texture-heavy regions.
-
-Fixed parameters for all WebRTC/Discord scenarios:
-
-- B-frames = 0 (WebRTC does not tolerate B-frames)
-- `sliceMode=3, sliceModeData=1` (one slice per frame)
-- `repeatSPSPPS=1` by default; switched to 0 for clients that drive their own
-  packed headers (currently forced off in favour of always letting NVENC emit
-  SPS/PPS — see `end_picture` comment about stream stall root cause)
-- `enableWeightedPrediction=0`
-- `lookahead=0` (real time)
-- `zeroReorderDelay=1` (NVENC returns each frame immediately, no internal FIFO)
-
-NVENC presets P3–P7 require NVIDIA driver >= 520.x (NVENC SDK 12.0 API version).
-
----
-
-## Bitstream Output Pool
-
-`NvencSession` (`src/nvenc/session.rs`) owns a 6-slot round-robin pool of
-`NV_ENC_OUTPUT_PTR` handles created by `NvEncCreateBitstreamBuffer`. Each slot
-is in one of two states:
-
-- **`Free`** — available for the next `encode_picture` call.
-- **`Pending`** — NVENC returned `NV_ENC_ERR_NEED_MORE_INPUT` for the frame
-  targeting this slot. The `mapped_input` is kept alive until the deferred output
-  can be locked.
-
-Each `encode_frame` call runs three phases:
-
-1. **Non-blocking drain** — walks all Pending slots and attempts
-   `LockBitstream(doNotWait=1)`. Ready slots transition to Free and push their
-   bytes onto the `pending_outputs` FIFO.
-2. **Encode** — maps the surface, calls `NvEncEncodePicture`. On `SUCCESS`,
-   immediately locks, copies, and unlocks. On `NEED_MORE_INPUT`, marks the slot
-   Pending.
-3. **Output guarantee** — if the FIFO is still empty, attempts one non-blocking
-   probe of the oldest Pending slot. This covers the common case where NVENC
-   finished the current frame while phase 1 was running.
-
-The caller receives the oldest entry from `pending_outputs`, or a
-`CodedBitstream{is_pending: true}` if no output is available. WebRTC sees this
-as a frame drop, but it is preferable to a deadlock.
-
-6 slots covers CBR streams without look-ahead or B-frames with comfortable
-head-room for typical `NEED_MORE_INPUT` sequences.
-
----
-
-## ABI Safety
-
-**`catch_unwind` barrier.** Unwinding a Rust panic across an `extern "C"`
-boundary is undefined behaviour. Every vtable function and `__vaDriverInit_1_*`
-wraps its body in `std::panic::catch_unwind(AssertUnwindSafe(...))`. A caught
-panic returns `VA_STATUS_ERROR_UNKNOWN`. The `Cargo.toml` release profile sets
-`panic = "unwind"` (not `abort`) so the unwind machinery is available.
-
-**`Box::into_raw` / `Box::from_raw` for `pDriverData`.** `DriverState` is stored
-as a raw pointer in `ctx->pDriverData`. Sole owner is `driver_init` (via
-`Box::into_raw`). `vaTerminate` reclaims it via `Box::from_raw` and runs `Drop`.
-All other vtable functions access it read-only through `state_from`, which
-returns a shared reference scoped to the guard closure.
-
-**`#![deny(improper_ctypes_definitions)]`** — the compiler verifies ABI
-compatibility of all `extern "C"` declarations.
-
-**`parking_lot::Mutex` instead of `std::sync::Mutex`.** The standard mutex
-poisons on panic, complicating subsequent lock calls in FFI context.
-`parking_lot::Mutex` does not poison: with `catch_unwind` in place, a lock held
-by panicking code is released normally when the guard's `Drop` runs after the
-panic is caught.
-
-**`AssertUnwindSafe`.** `VADriverContextP` (a raw pointer) is not `UnwindSafe`
-by default. We assert that the pointer is valid for the entire driver lifetime
-and is not modified by any panicking code path.
-
----
-
-## Generational ID Mapping (slotmap)
-
-libva passes clients opaque 32-bit IDs (`VAConfigID`, `VASurfaceID`, etc.).
-Internally we use `slotmap::DenseSlotMap` with typed keys (`ConfigKey`,
-`SurfaceKey`, ...).
-
-Each key stores a 64-bit `KeyData` encoding a slot index and a generation
-counter. A stale ID from a removed slot does not match the generation of a
-new entry at the same index — aliasing is impossible.
-
-Translation (`src/ids.rs`):
-
-- `key_to_id` — truncates `KeyData` to 32 bits. Safe for pools with fewer than
-  2^16 live entries.
-- `id_to_key` / `find_by_low_bits` — linear scan comparing low 32 bits.
-  Acceptable because pools are small (tens of entries) and this is off the
-  encode hot path.
-- `key_from_raw` — lossless round-trip via full 64-bit `KeyData::as_ffi`, used
-  for internal back-references such as `CodedBuffer` in `ContextRec`.
-
----
-
-## Thread Safety
-
-libva does not specify thread-safety guarantees for a single `VADisplay`. In
-practice, Chromium calls VA functions from a dedicated GPU thread, so concurrent
-access is not expected on the normal screen-share path. We protect all shared
-state defensively:
-
-- `DriverState::pools` is wrapped in `parking_lot::Mutex`. Every vtable function
-  acquires the lock at entry and releases it before returning. No function holds
-  the lock across an FFI callback.
-- Per-object fields that need finer granularity (`SurfaceRec::registered`,
-  `ContextRec::current_target`, `ContextRec::session`, `ContextRec::pending`,
-  `BufferRec::storage`, `BufferRec::coded_ready`) each carry their own
-  `parking_lot::Mutex`.
-- The CUDA context is bound to the calling thread before any NVENC call via
-  `CudaContext::bind_to_thread`.
-- `parking_lot::Mutex` is chosen over `std::sync::Mutex` because it does not
-  poison on panic — a poisoned mutex in an FFI context would require the caller
-  to handle an unexpected error on every subsequent lock attempt. Since we use
-  `catch_unwind` at the ABI boundary anyway, non-poisoning semantics are correct
-  here.
-
----
-
-## Panic Safety
-
-Unwinding across an `extern "C"` boundary is undefined behaviour in Rust (the C
-caller has no unwind tables for Rust frames). The compiler catches some
-violations via `#![deny(improper_ctypes_definitions)]` but not all.
-
-Every `extern "C"` vtable function (and `__vaDriverInit_1_*`) wraps its body in
-`std::panic::catch_unwind(AssertUnwindSafe(...))`. On a caught panic the function
-returns `VA_STATUS_ERROR_UNKNOWN`. The `Cargo.toml` release profile sets
-`panic = "unwind"` (not `abort`) so that the unwind machinery is available.
-
-`AssertUnwindSafe` is used because `VADriverContextP` (a raw pointer) is not
-`UnwindSafe` by default. The pointer is valid for the entire driver lifetime and
-not modified by the panicking code path, so the assertion is correct.
-
-Closures passed to `catch_unwind` via the `guard` helper in `src/driver/mod.rs`
-should not contain `Mutex`-holding code that could leave a lock held on panic.
-`parking_lot::Mutex` is not poisoning, so a lock leaked by a panic will simply
-remain locked until the guard is eventually dropped — but with `catch_unwind` the
-guard's `Drop` runs normally after the panic is caught.
+# Architecture
+
+## Loading and state
+
+A VA-API client calls libva, which loads `nvidia_nvenc_drv_video.so` and resolves
+an exported `__vaDriverInit_1_*` entry point. The backend is a userspace library,
+not a kernel driver or a daemon. Driver state belongs to `VADriverContext` and
+is released by `vaTerminate`.
+
+`DriverState` owns lazy CUDA selection and `Mutex<Pools>`. Typed object pools
+store configs, surfaces, contexts, buffers and images. IDs are monotonically
+allocated nonzero 32-bit values and are never reused during the display's
+lifetime. Allocation fails before the invalid-ID sentinel or wraparound.
+
+## Encode lifecycle
+
+1. Config creation validates profile, entry point and rate-control mode.
+2. Surfaces own pitched CUDA NV12 memory or imported external memory.
+3. Context creation retains geometry and configuration. NVENC remains unopened.
+4. Begin/render collect a picture's input and parameter buffers.
+5. End validates output, merges sequence and misc controls, lazily opens or
+   reconfigures NVENC, and registers input in that session.
+6. NVENC maps and submits input with a distinct output buffer. A session worker
+   blocks for that output, copies compressed bytes, unlocks and unmaps input.
+   Linux uses synchronous NVENC calls; no B-frames or lookahead are enabled.
+7. Sync or coded-buffer mapping waits for the matching completion and publishes
+   its segment. Finite waits include pool-lock acquisition and preserve pending
+   output on timeout. Mapping exposes stable storage until unmap.
+
+Each session has four reusable outputs and a bounded work queue. Submission can
+continue while its worker waits for earlier outputs. Input reuse, CPU transfers,
+reconfiguration and resource destruction wait for the affected work. The worker
+never takes the display pool lock. Completed bytes belong to their original
+coded buffer and remain accessible after encoder/context destruction.
+
+## Resources and teardown
+
+Each `NvencSession` owns its output worker, bounded output pool and input
+registration cache. Registrations belong to a session, so two contexts may share
+one surface safely. Surface destruction unregisters it from all sessions before
+freeing CUDA memory. Driver termination destroys contexts before surfaces.
+
+Encoder creation is ordered across displays. The first backend-owned encoder
+on a CUDA device remains alive until its backend-owned peers close, even if
+its VA context is destroyed earlier. This works around
+[NVIDIA bug 4340965](https://forums.developer.nvidia.com/t/regression-with-use-after-free-linux-drivers-after-520-56-06-inside-nvenc/269974),
+where a runtime timer can reference the first encoder after destruction.
+Only one retired encoder and its CUDA context are retained per active device
+group; its inputs, output buffers and worker are released immediately. This can
+keep one NVENC session slot occupied until that group becomes idle. Native
+encoders opened by other libraries are outside this backend's lifetime registry.
+
+VA images use a host shadow for CPU access. Read mappings of derived internal
+images download current pixels; write mappings upload on unmap. Write-only
+access skips readback, and read-only access skips upload. Legacy mapping means
+read/write. Standalone images use explicit get/put transfers. NV12 readback
+supports even-aligned rectangles without scaling; puts require full frames.
+Imported external surfaces do not support CPU image access.
+
+Mapping a generic buffer retains its storage lock until unmap. Mutating,
+rendering or destroying mapped buffers must be rejected before attempting to
+take that lock. Failed transfers leave the buffer unmapped. Get/put using an
+image derived from the same surface returns surface-busy; transfers involving
+a different derived surface synchronise its host shadow with device memory.
+
+## Rate control and format limits
+
+Sequence parameters establish dimensions, cropping, bitrate, GOP and rational
+frame rate. Misc rate-control and frame-rate parameters take precedence. VBR
+keeps average and peak bitrate separate; CQP uses picture QP. Equal configs
+skip NVENC reconfiguration. Rate changes do not force IDR.
+
+NVENC generates H.264 headers. Arbitrary client packed headers, exact reference
+picture programming, all VA misc controls and arbitrary slice layouts are not
+fully implemented. Capability reporting must not promise those semantics.
+
+## External memory
+
+The import path validates a single-object, single-layer linear NV12 descriptor
+with two tightly packed planes, matching pitch, offsets and bounded allocation.
+Duplicated file descriptors transfer ownership only after successful CUDA
+import; the owning CUDA context remains alive through external-memory teardown.
+Descriptor validation alone does not establish interoperability with arbitrary
+DMA-BUF exporters or compositor modifiers. Surface export is unsupported.
+
+## Device selection
+
+An explicit PCI address takes precedence, followed by the display's DRM PCI
+address. A sole CUDA device may be selected without a DRM match; ambiguous
+selection fails. No application names or GPU models participate in routing.

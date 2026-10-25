@@ -7,30 +7,46 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- feat(rate-control): parse `VAEncMiscParameterBufferType` subtypes 0
-  (`VAEncMiscParameterTypeFrameRate`) and 1 (`VAEncMiscParameterTypeRateControl`)
-  in `render_picture`. The parsed values are stashed as `PendingFrame::misc_fps`
-  and `PendingFrame::misc_bitrate_bps` respectively (`src/driver/state.rs`).
-  In `end_picture`, if either field is present, `NvencSession::reconfigure` is
-  called with the updated `EncoderConfig` before encoding the frame, so the new
-  bitrate or framerate takes effect on the very next frame with a forced IDR.
-  This is required for Chromium WebRTC `RateController` compatibility:
-  Chromium sends a rate-control update on virtually every frame and penalises
-  encoders that ignore it by cycling them out in favour of software OpenH264.
+- Upload contiguous NV12 image planes with one pitched CUDA transfer instead
+  of two, validating plane offsets, stride and allocation bounds first.
+- Allow the benchmark tool to select a driver directory for build comparisons.
+
+- Initialise NVENC lazily from actual H.264 parameters and apply dynamic rate
+  control without forcing IDR for ordinary bitrate/framerate changes.
+- Load NVENC at runtime with explicit version/function validation; remove
+  link-time dependencies on NVIDIA encoding and decoding libraries.
+- Reuse coded-output storage across frames and cache input registrations per
+  session. Encode completion publishes the corresponding picture synchronously.
+- Install the library by atomic replacement. Optional session selection has a
+  matching removal command and does not overwrite unmanaged configuration.
 
 ### Fixed
 
-- fix(vbv): VBV buffer (`vbvBufferSize`) is now sized at 1 second of bitrate
-  (i.e. equal to `bitrate_bps`) with an initial delay of 0.5 seconds
-  (`bitrate_bps / 2`). The prior implementation sized it at one frame worth of
-  bits (`bitrate / fps`), which at low WebRTC targets such as 244 Kbps/60 fps
-  yielded a ~500-byte VBV buffer. NVENC then had insufficient headroom to
-  accommodate IDR frames (which can be 10–20 KB), causing it to either drop
-  frames or produce malformed bitstream segments. Chromium's encoder quality
-  controller interpreted the resulting gaps as encoder failures and switched back
-  to software OpenH264 after its 8-frame trial window.
+- Download current pixels when mapping derived NV12 images for reading;
+  honour read/write mapping flags and reject unknown access bits.
+- Reject unsupported CPU image access instead of silently skipping uploads,
+  and validate image dimensions before allocating objects.
+
+- Preserve rational frame rates and visible dimensions after H.264 cropping.
+- Keep VBR average and peak bitrate separate and honour constant-QP input.
+- Never reuse public object IDs; reject stale handles after destruction.
+- Reject conflicting mapped-buffer operations before locking or replacing
+  storage; validate coded output before submitting GPU work.
+- Retain context configuration after its public config object is destroyed.
+- Unregister inputs before releasing surface memory, including termination.
+- Validate external NV12 descriptor bounds and transferred FD ownership.
+- Stop advertising packed-header passthrough that is not implemented.
+
+### Added
+
+- NV12 image readback with chroma-aligned cropping and regression coverage
+  for mapping access, copies between surfaces and stale surface handles.
+
+- Regression coverage for ABI lifecycle, dynamic rate control, shared inputs,
+  full-stream decoding, installation and runtime API loading.
+- Comparative benchmark tool with output validation and separate pacing modes.
 
 ---
 
@@ -84,4 +100,4 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `vaEndPicture`. Currently single-object NV12 only; multi-object layouts and
   BGRA colour conversion are deferred.
 
-[Unreleased]: https://github.com/yourusername/libvaapi-rust-nvenc/compare/HEAD
+[Unreleased]: https://github.com/nitkanikita21/nvenc-vaapi-driver/compare/HEAD
